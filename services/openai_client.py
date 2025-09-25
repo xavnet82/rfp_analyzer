@@ -24,6 +24,10 @@ def _extract_json(text: str) -> str:
     if not m:
         raise RuntimeError("La respuesta del modelo no contiene JSON parseable.")
     return m.group(0)
+    
+def _is_temperature_error(e: Exception) -> bool:
+    s = str(e)
+    return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
 
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
