@@ -88,8 +88,12 @@ def main():
         for d in docs:
             status.info(f"Analizando: {d['name']} ({len(d['chunks'])} chunks)...")
             result = None
-            for ch in d["chunks"]:
-                result = analyze_text_chunk(result, ch, model=model)
+            for ch_idx, ch in enumerate(d["chunks"], start=1):
+                try:
+                    result = analyze_text_chunk(result, ch, model=model)
+                except Exception as e:
+                    st.error(f"Error analizando **{d['name']}**, chunk {ch_idx}/{len(d['chunks'])']}: {e}")
+                    raise
                 processed += 1
                 prog.progress(processed / max(total_chunks, 1))
             per_file_results[d["name"]] = result
