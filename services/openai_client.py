@@ -26,21 +26,52 @@ def _extract_json(text: str) -> str:
 
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
+# services/openai_client.py
+import json
+import re
+from typing import Optional
+
+from tenacity import retry, stop_after_attempt, wait_exponential
+from openai import OpenAI, BadRequestError
+# ... (resto de imports iguales)
+
+DEFAULT_TEMPERATURE = 0.1  # usado sólo si el modelo lo soporta
+
+def _extract_json(text: str) -> str:
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise RuntimeError("La respuesta del modelo no contiene JSON parseable.")
+    return m.group(0)
+
+def _is_temperature_error(e: Exception) -> bool:
+    s = str(e)
+    return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
+
+@retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
 def _call_openai(model: Optional[str], system: str, user: str) -> str:
     model = model or OPENAI_MODEL
 
-    # 1) Responses API (preferida)
+    # ---------- 1) Responses API (preferida) ----------
     try:
-        rsp = client.responses.create(
+        args = dict(
             model=model,
             input=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=0.1,
-            max_output_tokens=MAX_TOKENS_PER_REQUEST,
             response_format={"type": "json_object"},
+            max_output_tokens=MAX_TOKENS_PER_REQUEST,
+            temperature=DEFAULT_TEMPERATURE,
         )
+        try:
+            rsp = client.responses.create(**args)
+        except BadRequestError as e:
+            if _is_temperature_error(e):
+                # Reintentar sin temperature con Responses
+                args.pop("temperature", None)
+                rsp = client.responses.create(**args)
+            else:
+                raise
         try:
             return rsp.output_text
         except Exception:
@@ -48,9 +79,10 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
                 return rsp.choices[0].message.content
             return json.dumps(rsp)
     except (TypeError, AttributeError, BadRequestError):
+        # SDK antiguo o modelo que no soporta Responses/response_format -> fallback
         pass
 
-    # 2) Chat Completions (fallback robusto)
+    # ---------- 2) Chat Completions (fallback robusto) ----------
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -62,36 +94,53 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
 
     for use_rf in response_format_options:
         for token_param in token_params_order:
+            # 2.a) Intento con temperature
             kwargs = dict(
                 model=model,
                 messages=messages,
-                temperature=0.1,
+                temperature=DEFAULT_TEMPERATURE,
             )
             kwargs[token_param] = MAX_TOKENS_PER_REQUEST
             if use_rf:
                 kwargs["response_format"] = {"type": "json_object"}
-
             try:
                 rsp = client.chat.completions.create(**kwargs)
                 content = rsp.choices[0].message.content
-                if use_rf:
-                    return content
-                return _extract_json(content)
-            except TypeError as e:
-                last_error = e
-                continue
+                return content if use_rf else _extract_json(content)
             except BadRequestError as e:
+                # Si el problema es 'temperature', reintentamos la MISMA combinación sin temperature
+                if _is_temperature_error(e):
+                    try:
+                        kwargs_no_temp = dict(kwargs)
+                        kwargs_no_temp.pop("temperature", None)
+                        rsp = client.chat.completions.create(**kwargs_no_temp)
+                        content = rsp.choices[0].message.content
+                        return content if use_rf else _extract_json(content)
+                    except BadRequestError as e2:
+                        # Si ahora es otro unsupported_parameter (p.ej. max_tokens), seguimos iterando
+                        msg2 = str(e2)
+                        if "unsupported_parameter" in msg2 or "Unsupported parameter" in msg2:
+                            last_error = e2
+                            continue
+                        raise
+                # No es error de temperature: si es unsupported_parameter del token param, probar siguiente
                 msg = str(e)
                 if "unsupported_parameter" in msg or "Unsupported parameter" in msg:
                     last_error = e
                     continue
+                # Otros 400: propagar
                 raise
+            except TypeError as e:
+                # Firma del SDK no admite ese kwargs -> probar siguiente
+                last_error = e
+                continue
 
     raise RuntimeError(
         "No fue posible realizar la llamada a OpenAI con los parámetros disponibles. "
-        "Actualiza la librería `openai` (>=1.43) o ajusta el modelo en la barra lateral. "
+        "Actualiza `openai` (>=1.43) o ajusta el modelo en la barra lateral. "
         f"Último error: {last_error!r}"
     )
+
 
 
 def analyze_text_chunk(accumulated: Optional[OfertaAnalizada], chunk_text: str, model: Optional[str] = None) -> OfertaAnalizada:
