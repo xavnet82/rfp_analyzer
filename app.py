@@ -1,18 +1,46 @@
 import io
 import streamlit as st
-from config import APP_TITLE, OPENAI_MODEL, OPENAI_API_KEY
+from config import APP_TITLE, OPENAI_MODEL, OPENAI_API_KEY, ADMIN_USER, ADMIN_PASSWORD
 from services.pdf_loader import extract_pdf_text
 from services.openai_client import analyze_text_chunk, merge_offers
 from services.schema import OfertaAnalizada
 from utils.text import clean_text, chunk_text
 
+def login_gate():
+    # Si ya está autenticado, ofrecer cierre de sesión
+    if st.session_state.get("is_auth", False):
+        with st.sidebar:
+            if st.button("Cerrar sesión"):
+                st.session_state.clear()
+                st.rerun()
+        return True
+
+    st.set_page_config(page_title=APP_TITLE, layout="wide")
+    st.title("Acceso")
+    with st.form("login_form"):
+        u = st.text_input("Usuario")
+        p = st.text_input("Contraseña", type="password")
+        submitted = st.form_submit_button("Entrar")
+
+    if submitted:
+        if u == ADMIN_USER and p == ADMIN_PASSWORD:
+            st.session_state["is_auth"] = True
+            st.success("Acceso concedido.")
+            st.rerun()
+        else:
+            st.error("Credenciales inválidas.")
+    st.stop()
+
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 from components.ui import render_header, render_result
 
 def main():
+    # Gate de autenticación
+    login_gate()
+
     with st.sidebar:
         st.header("Configuración")
-        model = st.text_input("Modelo OpenAI", value=OPENAI_MODEL, help="p. ej. gpt-4o-mini, o el que tengas disponible")
+        model = st.text_input("Modelo OpenAI", value=OPENAI_MODEL, help="p. ej. gpt-4o-mini, gpt-5-mini, etc.")
         max_chars = st.slider("Tamaño aprox. de chunk (caracteres)", 6_000, 40_000, 12_000, step=1_000)
         st.caption("A mayor chunk, menos llamadas pero más tokens. Ajusta según coste/tiempo.")
         if not OPENAI_API_KEY:
