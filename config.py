@@ -18,3 +18,4 @@ OPENAI_API_KEY = _get("OPENAI_API_KEY", "")
 OPENAI_MODEL = _get("OPENAI_MODEL", "gpt-4o-mini")
 MAX_TOKENS_PER_REQUEST = int(_get("MAX_TOKENS_PER_REQUEST", "2000"))
 APP_TITLE = "Análisis de Pliegos – Licitaciones"
+OPENAI_TEMPERATURE = float(_get("OPENAI_TEMPERATURE", "1.0") or 1.0)
