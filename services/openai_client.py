@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from services.schema import OfertaAnalizada
 from services.prompts import SYSTEM_PROMPT, USER_PROMPT
 from config import OPENAI_API_KEY, OPENAI_MODEL, MAX_TOKENS_PER_REQUEST
+DEFAULT_TEMPERATURE = 0.1  # usado sólo si el modelo lo soporta
 
 if not OPENAI_API_KEY:
     raise RuntimeError(
