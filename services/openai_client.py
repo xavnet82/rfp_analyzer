@@ -128,10 +128,11 @@ def _loads_json_robust(raw):
 
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
+@retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
 def _call_openai(model: Optional[str], system: str, user: str) -> str:
     model = model or OPENAI_MODEL
 
-    # ---------- 1) Responses API (preferida) ----------
+    # 1) Responses API (preferida)
     try:
         args = dict(
             model=model,
@@ -147,34 +148,28 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
             rsp = client.responses.create(**args)
         except BadRequestError as e:
             if _is_temperature_error(e):
-                # Reintentar sin temperature con Responses
                 args.pop("temperature", None)
                 rsp = client.responses.create(**args)
             else:
                 raise
-        try:
-            return rsp.output_text
-        except Exception:
-            if hasattr(rsp, "choices") and rsp.choices:
-                return rsp.choices[0].message.content
-            return json.dumps(rsp)
+        text = _coalesce_text_from_responses(rsp)
+        if not text:
+            raise RuntimeError("Responses API devolvió salida sin texto utilizable.")
+        return text
     except (TypeError, AttributeError, BadRequestError):
-        # SDK antiguo o modelo que no soporta Responses/response_format -> fallback
         pass
 
-    # ---------- 2) Chat Completions (fallback robusto) ----------
+    # 2) Chat Completions (fallback)
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
-
     token_params_order = ("max_output_tokens", "max_completion_tokens", "max_tokens")
     response_format_options = (True, False)
     last_error = None
 
     for use_rf in response_format_options:
         for token_param in token_params_order:
-            # 2.a) Intento con temperature
             kwargs = dict(
                 model=model,
                 messages=messages,
@@ -183,35 +178,56 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
             kwargs[token_param] = MAX_TOKENS_PER_REQUEST
             if use_rf:
                 kwargs["response_format"] = {"type": "json_object"}
+
             try:
                 rsp = client.chat.completions.create(**kwargs)
-                content = rsp.choices[0].message.content
-                return content if use_rf else _extract_json(content)
-            except BadRequestError as e:
-                # Si el problema es 'temperature', reintentamos la MISMA combinación sin temperature
-                if _is_temperature_error(e):
+                content = _coalesce_text_from_chat(rsp)
+                if not content:
+                    # reintentar sin temperature si el modelo la rechaza
+                    kwargs_no_temp = dict(kwargs)
+                    kwargs_no_temp.pop("temperature", None)
                     try:
-                        kwargs_no_temp = dict(kwargs)
-                        kwargs_no_temp.pop("temperature", None)
                         rsp = client.chat.completions.create(**kwargs_no_temp)
-                        content = rsp.choices[0].message.content
-                        return content if use_rf else _extract_json(content)
+                        content = _coalesce_text_from_chat(rsp)
                     except BadRequestError as e2:
-                        # Si ahora es otro unsupported_parameter (p.ej. max_tokens), seguimos iterando
                         msg2 = str(e2)
                         if "unsupported_parameter" in msg2 or "Unsupported parameter" in msg2:
                             last_error = e2
                             continue
                         raise
-                # No es error de temperature: si es unsupported_parameter del token param, probar siguiente
+                if not content:
+                    # último intento: parsear de la representación completa
+                    raw_dump = json.dumps(rsp, default=str)
+                    # si hubiera JSON embebido, lo extraemos
+                    try:
+                        return _extract_json(raw_dump)
+                    except Exception:
+                        raise RuntimeError("Chat Completions devolvió salida sin texto utilizable.")
+
+                return content if use_rf else _extract_json(content)
+
+            except BadRequestError as e:
+                if _is_temperature_error(e):
+                    try:
+                        kwargs_no_temp = dict(kwargs)
+                        kwargs_no_temp.pop("temperature", None)
+                        rsp = client.chat.completions.create(**kwargs_no_temp)
+                        content = _coalesce_text_from_chat(rsp)
+                        if not content:
+                            raise RuntimeError("Chat Completions sin temperature devolvió salida sin texto utilizable.")
+                        return content if use_rf else _extract_json(content)
+                    except BadRequestError as e2:
+                        msg2 = str(e2)
+                        if "unsupported_parameter" in msg2 or "Unsupported parameter" in msg2:
+                            last_error = e2
+                            continue
+                        raise
                 msg = str(e)
                 if "unsupported_parameter" in msg or "Unsupported parameter" in msg:
                     last_error = e
                     continue
-                # Otros 400: propagar
                 raise
             except TypeError as e:
-                # Firma del SDK no admite ese kwargs -> probar siguiente
                 last_error = e
                 continue
 
@@ -225,20 +241,11 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
 def analyze_text_chunk(accumulated: Optional[OfertaAnalizada], chunk_text: str, model: Optional[str] = None) -> OfertaAnalizada:
     user = USER_PROMPT.format(doc_text=chunk_text)
     raw = _call_openai(model, SYSTEM_PROMPT, user)
-
-    data = _loads_json_robust(raw)  # <-- parseo unificado y robusto
-
-    try:
-        parsed = OfertaAnalizada.model_validate(data)
-    except ValidationError as e:
-        # Deja el error claro (incluye un snippet de la salida para depurar)
-        snippet = (raw or "")[:400] if isinstance(raw, str) else str(raw)[:400]
-        raise ValueError(f"La salida del modelo no cumple el esquema. Muestra (primeros 400 chars): {snippet}") from e
-
+    data = _loads_json_robust(raw)
+    parsed = OfertaAnalizada.model_validate(data)
     if accumulated is None:
         return parsed
     return merge_offers(accumulated, parsed)
-
 
 def merge_offers(base: OfertaAnalizada, new: OfertaAnalizada) -> OfertaAnalizada:
     from copy import deepcopy
