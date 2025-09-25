@@ -1,7 +1,7 @@
 import json
 import re
 from pydantic import ValidationError
-from services.schema import OfertaAnalizad
+from services.schema import OfertaAnalizada
 from typing import Optional
 
 from tenacity import retry, stop_after_attempt, wait_exponential
