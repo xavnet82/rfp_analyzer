@@ -4,9 +4,9 @@ from typing import Optional
 from tenacity import retry, stop_after_attempt, wait_exponential
 from openai import OpenAI
 from pydantic import ValidationError
-from .schema import OfertaAnalizada
-from .prompts import SYSTEM_PROMPT, USER_PROMPT
-from ..config import OPENAI_API_KEY, OPENAI_MODEL, MAX_TOKENS_PER_REQUEST
+from services.schema import OfertaAnalizada
+from services.prompts import SYSTEM_PROMPT, USER_PROMPT
+from config import OPENAI_API_KEY, OPENAI_MODEL, MAX_TOKENS_PER_REQUEST
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
