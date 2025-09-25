@@ -17,27 +17,6 @@ if not OPENAI_API_KEY:
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 def _extract_json(text: str) -> str:
-    """
-    Extrae el primer bloque JSON de un texto.
-    Fallback para clientes que no soportan response_format.
-    """
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        raise RuntimeError("La respuesta del modelo no contiene JSON parseable.")
-    return m.group(0)
-
-@retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
-from __future__ import annotations
-import json, re
-from typing import Optional
-from tenacity import retry, stop_after_attempt, wait_exponential
-from openai import OpenAI
-from services.prompts import SYSTEM_PROMPT, USER_PROMPT
-from config import OPENAI_API_KEY, OPENAI_MODEL, MAX_TOKENS_PER_REQUEST
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-def _extract_json(text: str) -> str:
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if not m:
         raise RuntimeError("La respuesta del modelo no contiene JSON parseable.")
