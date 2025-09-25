@@ -30,6 +30,73 @@ def _strip_code_fences(s: str) -> str:
     s = re.sub(r'\s*```\s*$', '', s)
     return s
 
+def _coalesce_text_from_responses(rsp) -> str | None:
+    """
+    Intenta extraer texto de múltiples formas del objeto devuelto por la Responses API,
+    compatible con variaciones de SDK (output_text, output[*].content[*].text, choices...).
+    """
+    # 1) SDKs recientes
+    txt = getattr(rsp, "output_text", None)
+    if txt:
+        return txt
+
+    # 2) Recorrer bloques de salida
+    out = getattr(rsp, "output", None)
+    if out:
+        texts = []
+        for item in out:
+            # item.content suele ser una lista de bloques con .type y .text
+            content = getattr(item, "content", None)
+            if isinstance(content, list):
+                for block in content:
+                    # Algunas versiones usan .text; otras .value o dict-like
+                    val = getattr(block, "text", None)
+                    if val:
+                        texts.append(val)
+                    else:
+                        # acceso dict-like
+                        if isinstance(block, dict):
+                            t = block.get("text") or block.get("value")
+                            if t:
+                                texts.append(t)
+        if texts:
+            return "\n".join(texts)
+
+    # 3) Algunos SDKs dejan contenido en choices[0].message.content
+    choices = getattr(rsp, "choices", None)
+    if choices:
+        msg = getattr(choices[0], "message", None)
+        if msg is not None:
+            content = getattr(msg, "content", None)
+            if content:
+                return content
+
+    return None
+
+def _coalesce_text_from_chat(rsp) -> str | None:
+    """
+    Extrae contenido de Chat Completions robustamente.
+    """
+    choices = getattr(rsp, "choices", None)
+    if not choices:
+        return None
+    msg = getattr(choices[0], "message", None)
+    if msg is None:
+        return None
+    content = getattr(msg, "content", None)
+    if content:
+        return content
+    # Últimos intentos por si el SDK usa dicts internos raros
+    if isinstance(msg, dict):
+        return msg.get("content")
+    return None
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*```\s*$', '', s)
+    return s
+
 def _extract_json(text: str) -> str:
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if not m:
@@ -37,40 +104,26 @@ def _extract_json(text: str) -> str:
     return m.group(0)
 
 def _loads_json_robust(raw):
-    """Devuelve un objeto Python (dict/list). Acepta:
-       - JSON normal
-       - JSON dentro de fences ```json ... ```
-       - JSON doblemente codificado (p.ej. '"{...}"')
-       - Texto con ruido donde se pueda extraer el primer {...}
-    """
     if raw is None:
         raise RuntimeError("Respuesta vacía del modelo.")
     if not isinstance(raw, str):
         return raw
-
     s = _strip_code_fences(raw)
     if not s:
         raise RuntimeError("El modelo devolvió cadena vacía.")
-
-    # 1) JSON directo
     try:
         obj = json.loads(s)
     except json.JSONDecodeError:
-        # 2) Intento extraer el primer bloque {...}
         brace = _extract_json(s)
         return json.loads(brace)
-
-    # 3) Si parsea a str, puede venir doblemente codificado
     if isinstance(obj, str):
         inner = _strip_code_fences(obj)
         if not inner:
             raise RuntimeError("El modelo devolvió cadena vacía tras decodificar.")
         if inner.startswith("{") or inner.startswith("["):
             return json.loads(inner)
-        # último intento: extraer {...} de esa cadena
         brace = _extract_json(inner)
         return json.loads(brace)
-
     return obj
 
 
