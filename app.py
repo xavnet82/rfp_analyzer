@@ -1,4 +1,7 @@
-import io
+import os, sys
+ROOT = os.path.dirname(__file__)
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 import streamlit as st
 from config import APP_TITLE, OPENAI_MODEL, OPENAI_API_KEY, ADMIN_USER, ADMIN_PASSWORD
 from services.pdf_loader import extract_pdf_text
