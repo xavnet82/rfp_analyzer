@@ -92,10 +92,10 @@ def main():
                 try:
                     result = analyze_text_chunk(result, ch, model=model)
                 except Exception as e:
-                    st.error(f"Error analizando **{d['name']}**, chunk {ch_idx}/{len(d['chunks'])']}: {e}")
+                    st.error(f"Error analizando **{d['name']}**, chunk {ch_idx}/{len(d['chunks'])}: {e}")
                     raise
-                        processed += 1
-                        prog.progress(processed / max(total_chunks, 1))
+                processed += 1
+                prog.progress(processed / max(total_chunks, 1))
             per_file_results[d["name"]] = result
             aggregate_result = result if aggregate_result is None else merge_offers(aggregate_result, result)
 
