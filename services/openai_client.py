@@ -26,28 +26,6 @@ def _extract_json(text: str) -> str:
 
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
-# services/openai_client.py
-import json
-import re
-from typing import Optional
-
-from tenacity import retry, stop_after_attempt, wait_exponential
-from openai import OpenAI, BadRequestError
-# ... (resto de imports iguales)
-
-DEFAULT_TEMPERATURE = 0.1  # usado sólo si el modelo lo soporta
-
-def _extract_json(text: str) -> str:
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        raise RuntimeError("La respuesta del modelo no contiene JSON parseable.")
-    return m.group(0)
-
-def _is_temperature_error(e: Exception) -> bool:
-    s = str(e)
-    return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
-
-@retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
 def _call_openai(model: Optional[str], system: str, user: str) -> str:
     model = model or OPENAI_MODEL
 
@@ -140,7 +118,6 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
         "Actualiza `openai` (>=1.43) o ajusta el modelo en la barra lateral. "
         f"Último error: {last_error!r}"
     )
-
 
 
 def analyze_text_chunk(accumulated: Optional[OfertaAnalizada], chunk_text: str, model: Optional[str] = None) -> OfertaAnalizada:
