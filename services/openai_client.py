@@ -1,5 +1,7 @@
 import json
 import re
+from pydantic import ValidationError
+from services.schema import OfertaAnalizad
 from typing import Optional
 
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -18,16 +20,58 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+def _is_temperature_error(e: Exception) -> bool:
+    s = str(e)
+    return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s*```\s*$', '', s)
+    return s
 
 def _extract_json(text: str) -> str:
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if not m:
         raise RuntimeError("La respuesta del modelo no contiene JSON parseable.")
     return m.group(0)
-    
-def _is_temperature_error(e: Exception) -> bool:
-    s = str(e)
-    return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
+
+def _loads_json_robust(raw):
+    """Devuelve un objeto Python (dict/list). Acepta:
+       - JSON normal
+       - JSON dentro de fences ```json ... ```
+       - JSON doblemente codificado (p.ej. '"{...}"')
+       - Texto con ruido donde se pueda extraer el primer {...}
+    """
+    if raw is None:
+        raise RuntimeError("Respuesta vacía del modelo.")
+    if not isinstance(raw, str):
+        return raw
+
+    s = _strip_code_fences(raw)
+    if not s:
+        raise RuntimeError("El modelo devolvió cadena vacía.")
+
+    # 1) JSON directo
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        # 2) Intento extraer el primer bloque {...}
+        brace = _extract_json(s)
+        return json.loads(brace)
+
+    # 3) Si parsea a str, puede venir doblemente codificado
+    if isinstance(obj, str):
+        inner = _strip_code_fences(obj)
+        if not inner:
+            raise RuntimeError("El modelo devolvió cadena vacía tras decodificar.")
+        if inner.startswith("{") or inner.startswith("["):
+            return json.loads(inner)
+        # último intento: extraer {...} de esa cadena
+        brace = _extract_json(inner)
+        return json.loads(brace)
+
+    return obj
 
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
@@ -128,15 +172,15 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
 def analyze_text_chunk(accumulated: Optional[OfertaAnalizada], chunk_text: str, model: Optional[str] = None) -> OfertaAnalizada:
     user = USER_PROMPT.format(doc_text=chunk_text)
     raw = _call_openai(model, SYSTEM_PROMPT, user)
-    data = json.loads(raw)
+
+    data = _loads_json_robust(raw)  # <-- parseo unificado y robusto
 
     try:
         parsed = OfertaAnalizada.model_validate(data)
     except ValidationError as e:
-        if isinstance(data, str):
-            parsed = OfertaAnalizada.model_validate(json.loads(data))
-        else:
-            raise e
+        # Deja el error claro (incluye un snippet de la salida para depurar)
+        snippet = (raw or "")[:400] if isinstance(raw, str) else str(raw)[:400]
+        raise ValueError(f"La salida del modelo no cumple el esquema. Muestra (primeros 400 chars): {snippet}") from e
 
     if accumulated is None:
         return parsed
