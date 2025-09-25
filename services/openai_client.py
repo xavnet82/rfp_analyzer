@@ -126,9 +126,7 @@ def _loads_json_robust(raw):
         return json.loads(brace)
     return obj
 
-
-@retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
-@retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3))
+@retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3), reraise=True)   # <--- añade esto
 def _call_openai(model: Optional[str], system: str, user: str) -> str:
     model = model or OPENAI_MODEL
 
@@ -238,88 +236,90 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
     )
 
 
-def analyze_text_chunk(accumulated: Optional[OfertaAnalizada], chunk_text: str, model: Optional[str] = None) -> OfertaAnalizada:
+def analyze_text_chunk(accumulated: Optional[OfertaAnalizada],
+                       chunk_text: str,
+                       model: Optional[str] = None) -> OfertaAnalizada:
     user = USER_PROMPT.format(doc_text=chunk_text)
-    raw = _call_openai(model, SYSTEM_PROMPT, user)
-    data = _loads_json_robust(raw)
+    raw = _call_openai(model, SYSTEM_PROMPT, user)  # si falla, ahora verás la causa real
+    data = _loads_json_robust(raw)                  # parser robusto (el que ya añadiste)
+
     parsed = OfertaAnalizada.model_validate(data)
+
     if accumulated is None:
         return parsed
-    return merge_offers(accumulated, parsed)
+    return merge_offers(accumulated, parsed)   # <-- llamada limpia
+
 
 def merge_offers(base: OfertaAnalizada, new: OfertaAnalizada) -> OfertaAnalizada:
     from copy import deepcopy
-
     out = deepcopy(base)
-    # Resumen y objetivos
+
+    # Resumen/objetivos/alcance
     if len((new.resumen_servicios or "")) > len((out.resumen_servicios or "")):
         out.resumen_servicios = new.resumen_servicios
     if new.objetivos:
         seen = set(out.objetivos)
         for o in new.objetivos:
             if o not in seen:
-                out.objetivos.append(o)
-                seen.add(o)
+                out.objetivos.append(o); seen.add(o)
     out.alcance = out.alcance or new.alcance
 
     # Importes
     out.importe_total = new.importe_total or out.importe_total
     out.moneda = new.moneda or out.moneda
-    seen_imp = {(d.concepto, d.importe, d.moneda) for d in out.importes_detalle}
-    for d in new.importes_detalle:
+    seen_imp = {(d.concepto, d.importe, d.moneda) for d in (out.importes_detalle or [])}
+    for d in (new.importes_detalle or []):
         key = (d.concepto, d.importe, d.moneda)
         if key not in seen_imp:
-            out.importes_detalle.append(d)
-            seen_imp.add(key)
+            out.importes_detalle.append(d); seen_imp.add(key)
 
     # Criterios
-    existing = {c.nombre: c for c in out.criterios_valoracion}
-    for c in new.criterios_valoracion:
+    existing = {c.nombre: c for c in (out.criterios_valoracion or [])}
+    for c in (new.criterios_valoracion or []):
         if c.nombre in existing:
             ex = existing[c.nombre]
             ex.peso_max = ex.peso_max or c.peso_max
             ex.tipo = ex.tipo or c.tipo
-            names = {s.nombre for s in ex.subcriterios}
-            for s in c.subcriterios:
+            names = {s.nombre for s in (ex.subcriterios or [])}
+            for s in (c.subcriterios or []):
                 if s.nombre not in names:
                     ex.subcriterios.append(s)
         else:
             out.criterios_valoracion.append(c)
 
-    # Índices
-    titles_sol = {s.titulo: s for s in out.indice_respuesta_tecnica}
-    for s in new.indice_respuesta_tecnica:
+    # Índice solicitado
+    titles_sol = {s.titulo: s for s in (out.indice_respuesta_tecnica or [])}
+    for s in (new.indice_respuesta_tecnica or []):
         if s.titulo in titles_sol:
             ex = titles_sol[s.titulo]
             ex.descripcion = ex.descripcion or s.descripcion
-            subs = set(ex.subapartados)
-            for sub in s.subapartados:
+            subs = set(ex.subapartados or [])
+            for sub in (s.subapartados or []):
                 if sub not in subs:
                     ex.subapartados.append(sub)
         else:
             out.indice_respuesta_tecnica.append(s)
 
-    titles_prop = {s.titulo: s for s in out.indice_propuesto}
-    for s in new.indice_propuesto:
+    # Índice propuesto
+    titles_prop = {s.titulo: s for s in (out.indice_propuesto or [])}
+    for s in (new.indice_propuesto or []):
         if s.titulo in titles_prop:
             ex = titles_prop[s.titulo]
             ex.descripcion = ex.descripcion or s.descripcion
-            subs = set(ex.subapartados)
-            for sub in s.subapartados:
+            subs = set(ex.subapartados or [])
+            for sub in (s.subapartados or []):
                 if sub not in subs:
                     ex.subapartados.append(sub)
         else:
             out.indice_propuesto.append(s)
 
     # Riesgos
-    if new.riesgos_y_dudas and (
-        not out.riesgos_y_dudas or len(new.riesgos_y_dudas) > len(out.riesgos_y_dudas)
-    ):
+    if new.riesgos_y_dudas and (not out.riesgos_y_dudas or len(new.riesgos_y_dudas) > len(out.riesgos_y_dudas)):
         out.riesgos_y_dudas = new.riesgos_y_dudas
 
     # Páginas
-    pages = set(out.referencias_paginas)
-    for p in new.referencias_paginas:
+    pages = set(out.referencias_paginas or [])
+    for p in (new.referencias_paginas or []):
         pages.add(p)
     out.referencias_paginas = sorted(pages)
 
