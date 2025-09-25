@@ -4,13 +4,38 @@ from services.schema import OfertaAnalizada, Criterio, SeccionIndice, ImporteDet
 
 def render_header(title: str):
     st.title(title)
-    st.caption("Analiza pliegos PDF y obtiene un resumen estructurado.")
+    st.caption("Analiza pliegos PDF (uno o varios) y obtiene un resumen estructurado.")
+
+def _render_indice(nombre: str, indice: List[SeccionIndice]):
+    st.subheader(nombre)
+    if indice:
+        for i, sec in enumerate(indice, 1):
+            with st.expander(f"{i}. {sec.titulo}", expanded=False):
+                if sec.descripcion:
+                    st.write(sec.descripcion)
+                for j, sub in enumerate(sec.subapartados, 1):
+                    st.write(f"{i}.{j} {sub}")
+    else:
+        st.write("No se detectó información en esta sección.")
 
 def render_result(result: OfertaAnalizada):
     tabs = st.tabs(["Resumen", "Importes", "Criterios", "Índice", "Riesgos", "Exportar"])
     with tabs[0]:
         st.subheader("Servicios solicitados")
         st.write(result.resumen_servicios or "No disponible")
+
+        cols = st.columns(2)
+        with cols[0]:
+            st.markdown("### Objetivos del pliego")
+            if result.objetivos:
+                for o in result.objetivos:
+                    st.write(f"- {o}")
+            else:
+                st.write("No se detectaron objetivos explícitos.")
+        with cols[1]:
+            st.markdown("### Alcance y límites")
+            st.write(result.alcance or "No disponible")
+
         if result.referencias_paginas:
             st.info("Referencias de páginas: " + ", ".join(map(str, result.referencias_paginas)))
     with tabs[1]:
@@ -39,16 +64,11 @@ def render_result(result: OfertaAnalizada):
         else:
             st.write("No se detectaron criterios.")
     with tabs[3]:
-        st.subheader("Índice de la respuesta técnica")
-        if result.indice_respuesta_tecnica:
-            for i, sec in enumerate(result.indice_respuesta_tecnica, 1):
-                with st.expander(f"{i}. {sec.titulo}", expanded=False):
-                    if sec.descripcion:
-                        st.write(sec.descripcion)
-                    for j, sub in enumerate(sec.subapartados, 1):
-                        st.write(f"{i}.{j} {sub}")
-        else:
-            st.write("No se detectó un índice propuesto.")
+        sub = st.tabs(["Índice solicitado (literal)", "Índice propuesto (alineado)"])
+        with sub[0]:
+            _render_indice("Índice solicitado (del pliego)", result.indice_respuesta_tecnica)
+        with sub[1]:
+            _render_indice("Índice propuesto", result.indice_propuesto)
     with tabs[4]:
         st.subheader("Riesgos y dudas")
         st.write(result.riesgos_y_dudas or "No se detectaron riesgos/dudas.")
