@@ -47,7 +47,7 @@ def login():
         if ok:
             if u == admin_user and p == admin_pass:
                 st.session_state["auth"] = True
-                st.success("Acceso concedido.")
+                #st.success("Acceso concedido.")
             else:
                 st.error("Credenciales inválidas.")
     st.stop()
