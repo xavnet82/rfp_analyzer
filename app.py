@@ -3,10 +3,12 @@
 # RFP Analyzer – Streamlit (consultoría TI) | "PDF completo" + fallback local
 # - Modelos visibles: gpt-4o y gpt-4o-mini (temperatura configurable desde sidebar)
 # - UX de una sola vista de análisis + una pestaña de "Registro (Prompts/Respuestas)"
-# - Sin file_search ni attachments: enviamos los PDFs como input_file a /responses
+# - Envío de PDFs como input_file a /responses (sin tools ni attachments)
 # - Fallback local con selección de páginas relevantes y síntesis garantizada
 # - Prompts robustos: JSON obligatorio, evidencias, discrepancias, no alucinar
-# - Sección “Formato y entrega de la oferta”
+# - Incluye “Formato y entrega de la oferta”
+# - Log tab: expander para TODAS las secciones (incluida Formato/Entrega)
+# - Índice técnico: ahora se renderiza título + descripción + subapartados
 # -----------------------------------------------------------------------------------
 
 import os
@@ -26,8 +28,8 @@ OPENAI_MODEL_DEFAULT = "gpt-4o"
 OPENAI_API_KEY = None
 ADMIN_USER = "admin"
 ADMIN_PASSWORD = "rfpanalyzer"
-MAX_TOKENS_PER_REQUEST = 1800  # salida de cada sección (JSON), prudente
-DEFAULT_TEMPERATURE = 0.2      # valor por defecto del slider
+MAX_TOKENS_PER_REQUEST = 1800  # salida de cada sección (JSON)
+DEFAULT_TEMPERATURE = 0.2
 
 try:
     from config import (  # type: ignore
@@ -94,7 +96,6 @@ except Exception:
     def extract_pdf_text(file_like: io.BytesIO) -> Tuple[List[str], str]:
         return _fallback_extract_pdf_text(file_like)
 
-# limpieza simple
 def clean_text(s: str) -> str:
     s = s.replace("\x00", " ")
     s = re.sub(r"[ \t]+", " ", s)
@@ -132,7 +133,7 @@ def login_gate():
     st.stop()
 
 # -----------------------------------------------------------------------------------
-# Prompts “excelentes”: SYSTEM + SECCIONES (incluye nueva sección formato_oferta)
+# Prompts “excelentes”: SYSTEM + SECCIONES
 # -----------------------------------------------------------------------------------
 SYSTEM_PREFIX = (
   "Eres analista sénior de licitaciones en España y consultor TI."
@@ -161,15 +162,6 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       '  "discrepancias": [str]'
       "}"
       "\nReglas: no inventes; si no hay dato, usa null/[]."
-      "\nEjemplo (mínimo):\n"
-      '{'
-      '  "resumen_servicios": null,'
-      '  "objetivos": [],'
-      '  "alcance": null,'
-      '  "referencias_paginas": [],'
-      '  "evidencias": [],'
-      '  "discrepancias": []'
-      "}"
     ),
   },
   "servicios": {
@@ -198,15 +190,6 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       '  "discrepancias": [str]'
       "}"
       "\nReglas: deduplica; no inventes; null/[] si no hay."
-      "\nEjemplo (mínimo):\n"
-      '{'
-      '  "resumen_servicios": null,'
-      '  "servicios_detalle": [],'
-      '  "alcance": null,'
-      '  "referencias_paginas": [],'
-      '  "evidencias": [],'
-      '  "discrepancias": []'
-      "}"
     ),
   },
   "importe": {
@@ -228,17 +211,6 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       '  "discrepancias": [str]'
       "}"
       "\nReglas: números con punto; si hay varias cifras, recoge todas en importes_detalle y usa discrepancias."
-      "\nEjemplo (mínimo):\n"
-      '{'
-      '  "importe_total": null,'
-      '  "moneda": null,'
-      '  "iva_incluido": null,'
-      '  "tipo_iva": null,'
-      '  "importes_detalle": [],'
-      '  "referencias_paginas": [],'
-      '  "evidencias": [],'
-      '  "discrepancias": []'
-      "}"
     ),
   },
   "criterios_valoracion": {
@@ -265,21 +237,17 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       '  "discrepancias": [str]'
       "}"
       "\nReglas: conserva jerarquía; null/[] si no hay."
-      "\nEjemplo (mínimo):\n"
-      '{'
-      '  "criterios_valoracion": [],'
-      '  "criterios_desempate": [],'
-      '  "referencias_paginas": [],'
-      '  "evidencias": [],'
-      '  "discrepancias": []'
-      "}"
     ),
   },
   "indice_tecnico": {
     "titulo": "Índice de la respuesta técnica",
     "user_prompt": (
-      "1) Analiza en detalle la propuesta e identifica, si existe, el índice solicitado literal para la respuesta técnica. 2) Si no existiera, propon en base al pliego un índice alineado (implementable), que contenga contexto, nuestro enfoque, metodología, alcance y actividades, planificación, equipo, etc"
-      " Devuelve SIEMPRE las claves."
+      # *** Prompt reforzado según tu enunciado ***
+      "1) Analiza en detalle la propuesta e identifica, si existe, el índice solicitado literal para la respuesta técnica. "
+      "2) Si no existiera, propón en base al pliego un índice alineado (implementable), que contenga al menos: contexto, "
+      "nuestro enfoque, metodología, alcance y actividades, planificación con hitos, equipo y roles, governance, gestión de calidad y SLAs, "
+      "gestión de riesgos/continuidad, ciberseguridad/compliance, sostenibilidad/accesibilidad y anexos. "
+      "El índice propuesto NO debe ir vacío y debe ser accionable (con subapartados)."
       "\nSalida JSON EXACTA:\n"
       "{"
       '  "indice_respuesta_tecnica": ['
@@ -293,16 +261,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       '  "evidencias": [{"pagina": int, "cita": str}],'
       '  "discrepancias": [str]'
       "}"
-      "\nReglas: si no hay índice literal, 'indice_respuesta_tecnica' puede ir [], pero 'indice_propuesto' NO debe ir vacío."
-      "\nEjemplo (mínimo):\n"
-      '{'
-      '  "indice_respuesta_tecnica": [],'
-      '  "indice_propuesto": [{"titulo": "Propuesta de valor", "descripcion": null, "subapartados": []}],'
-      '  "trazabilidad": [],'
-      '  "referencias_paginas": [],'
-      '  "evidencias": [],'
-      '  "discrepancias": []'
-      "}"
+      "\nReglas: si no hay índice literal, 'indice_respuesta_tecnica' puede ir [], pero 'indice_propuesto' DEBE incluir >=10 apartados con subapartados clave."
     ),
   },
   "riesgos_exclusiones": {
@@ -323,15 +282,6 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       '  "discrepancias": [str]'
       "}"
       "\nReglas: no inventes fuera del pliego; si infieres, debe ser coherente con lo que SÍ aparece."
-      "\nEjemplo (mínimo):\n"
-      '{'
-      '  "riesgos_y_dudas": null,'
-      '  "exclusiones": [],'
-      '  "matriz_riesgos": [],'
-      '  "referencias_paginas": [],'
-      '  "evidencias": [],'
-      '  "discrepancias": []'
-      "}"
     ),
   },
   "solvencia": {
@@ -351,23 +301,14 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       '  "discrepancias": [str]'
       "}"
       "\nReglas: una condición por bullet; null/[] si no hay."
-      "\nEjemplo (mínimo):\n"
-      '{'
-      '  "solvencia": {"tecnica": [], "economica": [], "administrativa": [], "acreditacion": []},'
-      '  "referencias_paginas": [],'
-      '  "evidencias": [],'
-      '  "discrepancias": []'
-      "}"
     ),
   },
-  # -------- Sección: Formato y entrega de la oferta --------
   "formato_oferta": {
     "titulo": "Formato y entrega de la oferta",
     "user_prompt": (
-      "Extrae requisitos de formato y entrega de la oferta (memoria técnica/administrativa), tales como: extensión máxima en "
-      "páginas, tamaño mínimo de fuente, tipografía, interlineado, márgenes, estructura documental requerida, idioma, número de copias, "
-      "formato/s de archivo permitido (PDF/DOCX/etc.), tamaño máximo por archivo, necesidad de firma digital y quién debe firmar, "
-      "paginación/ numeración requerida, etiquetado de sobres/archivos, canal de entrega (plataforma, registro, sobre electrónico), "
+      "Extrae requisitos de formato y entrega de la oferta (memoria técnica/administrativa): extensión máxima, tamaño de fuente, "
+      "tipografía, interlineado, márgenes, estructura documental requerida, idioma, número de copias, formatos de archivo, tamaño máximo, "
+      "firma digital y quién firma, paginación/numeración, etiquetado de sobres/archivos, canal de entrega (plataforma/sobre electrónico), "
       "plazo/fecha/hora y zona horaria, instrucciones de presentación y anexos obligatorios. Devuelve SIEMPRE las claves."
       "\nSalida JSON EXACTA:\n"
       "{"
@@ -398,26 +339,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       '  "evidencias": [{"pagina": int, "cita": str}],'
       '  "discrepancias": [str]'
       "}"
-      "\nReglas: no inventes; si no hay dato, usa null/[]; convierte longitudes numéricas cuando sea posible."
-      "\nEjemplo (mínimo):\n"
-      '{'
-      '  "formato_esperado": null,'
-      '  "longitud_paginas": null,'
-      '  "tipografia": {"familia": null, "tamano_min": null, "interlineado": null, "margenes": null},'
-      '  "estructura_documental": [],'
-      '  "requisitos_presentacion": [],'
-      '  "requisitos_archivo": {"formatos_permitidos": [], "tamano_max_mb": null, "firma_digital_requerida": null, "firmado_por": null},'
-      '  "idioma": null,'
-      '  "copias": null,'
-      '  "entrega": {"canal": null, "plazo": null, "zona_horaria": null, "instrucciones": []},'
-      '  "paginacion": {"requerida": null, "formato": null},'
-      '  "etiquetado": [],'
-      '  "anexos_obligatorios": [],'
-      '  "confidencialidad": null,'
-      '  "referencias_paginas": [],'
-      '  "evidencias": [],'
-      '  "discrepancias": []'
-      "}"
+      "\nReglas: no inventes; null/[] si no hay; convierte longitudes numéricas cuando sea posible."
     ),
   },
 }
@@ -426,56 +348,40 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
 # Palabras clave para selección local (recall)
 # -----------------------------------------------------------------------------------
 SECTION_KEYWORDS = {
-  "objetivos_contexto": {
-      "objeto del contrato": 5, "objeto": 3, "alcance": 4, "objetivo": 3,
-      "contexto": 3, "descripción del servicio": 4, "alcances": 3,
-  },
-  "servicios": {
-      "servicios": 5, "actividades": 4, "tareas": 4, "entregables": 4,
-      "nivel de servicio": 4, "sla": 3, "kpi": 3, "periodicidad": 3, "volumen": 3,
-  },
-  "importe": {
-      "presupuesto base": 6, "importe": 5, "precio": 4, "iva": 4,
-      "base imponible": 4, "prórroga": 4, "anualidad": 4, "licitación": 4,
-  },
-  "criterios_valoracion": {
-      "criterios de valoración": 6, "criterios de adjudicación": 6,
-      "baremo": 5, "puntuación": 5, "puntos": 4, "porcentaje": 4,
-      "peso": 4, "umbral": 4, "desempate": 4, "fórmula": 4,
-  },
-  "indice_tecnico": {
-      "índice": 6, "indice": 6, "estructura": 5, "estructura mínima": 6,
-      "contenido de la oferta": 6, "contenido mínimo": 6, "memoria técnica": 5,
-      "documentación técnica": 5, "apartados": 4, "secciones": 4,
-      "instrucciones de preparación": 5, "formato de la propuesta": 5,
-      "orden de contenidos": 5, "capítulos": 4, "anexos": 3,
-      "presentación de ofertas": 4, "sobre técnico": 5
-  },
-  "riesgos_exclusiones": {
-      "exclusiones": 7, "no incluye": 7, "quedan excluidos": 7,
-      "no serán objeto": 6, "limitaciones": 5, "incompatibilidades": 5,
-      "responsabilidad": 4, "exenciones": 4, "penalizaciones": 5,
-      "causas de exclusión": 6, "supuestos de exclusión": 6,
-      "condiciones especiales": 4, "garantías": 4, "plazos": 4,
-      "régimen sancionador": 5, "riesgos": 4, "restricciones": 4
-  },
-  "solvencia": {
-      "solvencia técnica": 6, "solvencia económica": 6, "solvencia financiera": 5,
-      "requisitos de solvencia": 6, "clasificación": 4, "experiencia": 4,
-      "medios personales": 4, "medios materiales": 4, "acreditación": 5,
-  },
-  "formato_oferta": {
-      "formato": 6, "formato de la oferta": 7, "formato de la propuesta": 6,
-      "presentación de ofertas": 7, "presentacion de ofertas": 7, "presentación": 5,
-      "memoria técnica": 6, "longitud": 6, "páginas": 6, "paginas": 6, "extensión": 6, "extension": 6,
-      "tamaño de letra": 6, "tamano de letra": 6, "tipografía": 5, "tipografia": 5,
-      "interlineado": 5, "márgenes": 5, "margenes": 5, "fuente": 5, "tipo de letra": 5,
-      "etiquetado": 5, "rotulación": 5, "rotulacion": 5, "sobres": 6, "sobre electrónico": 6,
-      "plataforma": 6, "perfil del contratante": 5, "archivo pdf": 6, "pdf": 5, "docx": 4,
-      "firma electrónica": 6, "firma digital": 6, "firmado": 5,
-      "idioma": 5, "copia": 5, "copias": 5, "paginación": 5, "numeración": 5,
-      "fecha de entrega": 6, "plazo de presentación": 6, "hora": 5, "zona horaria": 4,
-  },
+  "objetivos_contexto": {"objeto del contrato": 5, "objeto": 3, "alcance": 4, "objetivo": 3,
+                         "contexto": 3, "descripción del servicio": 4, "alcances": 3},
+  "servicios": {"servicios": 5, "actividades": 4, "tareas": 4, "entregables": 4,
+                "nivel de servicio": 4, "sla": 3, "kpi": 3, "periodicidad": 3, "volumen": 3},
+  "importe": {"presupuesto base": 6, "importe": 5, "precio": 4, "iva": 4,
+              "base imponible": 4, "prórroga": 4, "anualidad": 4, "licitación": 4},
+  "criterios_valoracion": {"criterios de valoración": 6, "criterios de adjudicación": 6,
+                           "baremo": 5, "puntuación": 5, "puntos": 4, "porcentaje": 4,
+                           "peso": 4, "umbral": 4, "desempate": 4, "fórmula": 4},
+  "indice_tecnico": {"índice": 6, "indice": 6, "estructura": 5, "estructura mínima": 6,
+                     "contenido de la oferta": 6, "contenido mínimo": 6, "memoria técnica": 5,
+                     "documentación técnica": 5, "apartados": 4, "secciones": 4,
+                     "instrucciones de preparación": 5, "formato de la propuesta": 5,
+                     "orden de contenidos": 5, "capítulos": 4, "anexos": 3,
+                     "presentación de ofertas": 4, "sobre técnico": 5},
+  "riesgos_exclusiones": {"exclusiones": 7, "no incluye": 7, "quedan excluidos": 7,
+                          "no serán objeto": 6, "limitaciones": 5, "incompatibilidades": 5,
+                          "responsabilidad": 4, "exenciones": 4, "penalizaciones": 5,
+                          "causas de exclusión": 6, "supuestos de exclusión": 6,
+                          "condiciones especiales": 4, "garantías": 4, "plazos": 4,
+                          "régimen sancionador": 5, "riesgos": 4, "restricciones": 4},
+  "solvencia": {"solvencia técnica": 6, "solvencia económica": 6, "solvencia financiera": 5,
+                "requisitos de solvencia": 6, "clasificación": 4, "experiencia": 4,
+                "medios personales": 4, "medios materiales": 4, "acreditación": 5},
+  "formato_oferta": {"formato": 6, "formato de la oferta": 7, "formato de la propuesta": 6,
+                     "presentación de ofertas": 7, "presentacion de ofertas": 7, "presentación": 5,
+                     "memoria técnica": 6, "longitud": 6, "páginas": 6, "paginas": 6, "extensión": 6, "extension": 6,
+                     "tamaño de letra": 6, "tamano de letra": 6, "tipografía": 5, "tipografia": 5,
+                     "interlineado": 5, "márgenes": 5, "margenes": 5, "fuente": 5, "tipo de letra": 5,
+                     "etiquetado": 5, "rotulación": 5, "rotulacion": 5, "sobres": 6, "sobre electrónico": 6,
+                     "plataforma": 6, "perfil del contratante": 5, "archivo pdf": 6, "pdf": 5, "docx": 4,
+                     "firma electrónica": 6, "firma digital": 6, "firmado": 5,
+                     "idioma": 5, "copia": 5, "copias": 5, "paginación": 5, "numeración": 5,
+                     "fecha de entrega": 6, "plazo de presentación": 6, "hora": 5, "zona horaria": 4},
 }
 
 SECTION_CONTEXT_TUNING = {
@@ -556,12 +462,6 @@ def _is_unsupported_param(e: Exception, param: str) -> bool:
     return (("unsupported_parameter" in s or "Unknown parameter" in s or "unexpected keyword" in s) and (param in s))
 
 def _responses_create_robust(args: dict):
-    """
-    Envuelve OpenAI Responses y se adapta a variaciones del SDK:
-    - Si 'temperature' no es soportado, la elimina
-    - Si 'response_format' no es soportado, la elimina
-    - Renombra max_output_tokens -> max_completion_tokens si hace falta
-    """
     a = dict(args)
     for _ in range(5):
         try:
@@ -583,7 +483,10 @@ def _responses_create_robust(args: dict):
 # Logging de prompts/respuestas
 # -----------------------------------------------------------------------------------
 def _log_init():
-    st.session_state.setdefault("logs", {k: [] for k in SECTION_SPECS})
+    # Asegurar que existen todas las claves (incluida formato_oferta)
+    st.session_state.setdefault("logs", {})
+    for k in SECTION_SPECS.keys():
+        st.session_state["logs"].setdefault(k, [])
 
 def _log_event(section_key: str, fase: str, prompt: str, response_text: str, modelo: str):
     _log_init()
@@ -604,16 +507,12 @@ def _file_input_section_call(
     file_ids: List[str],
     section_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Envía los PDFs como bloques input_file a /responses y registra el prompt/respuesta.
-    """
     sys_msg = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PREFIX}]}
     content = [{"type": "input_text", "text": user_prompt}]
     for fid in file_ids:
         content.append({"type": "input_file", "file_id": fid})
     usr_msg = {"role": "user", "content": content}
 
-    # Para el log (no volcamos PDFs, solo IDs)
     log_prompt = f"[SYSTEM]\n{SYSTEM_PREFIX}\n\n[USER]\n{user_prompt}\n\n[FILES]\n" + "\n".join(file_ids)
 
     args = dict(
@@ -748,7 +647,8 @@ def _synthesis_fill_section(section_key: str, model: str, temperature: float):
         instruction = (
             "No hay índice literal claro. Constrúyelo a partir de objetivos, alcance, servicios y criterios del pliego. "
             "Devuelve SOLO JSON con claves obligatorias: 'indice_respuesta_tecnica' (puede ir []), "
-            "'indice_propuesto' (NO vacío), 'trazabilidad' (opcional), 'referencias_paginas', 'evidencias', 'discrepancias'."
+            "'indice_propuesto' (NO vacío con >=10 apartados y subapartados), 'trazabilidad' (opcional), "
+            "'referencias_paginas', 'evidencias', 'discrepancias'."
         )
         schema_hint = SECTION_SPECS["indice_tecnico"]["user_prompt"]
     else:
@@ -813,7 +713,7 @@ def _dedupe_sorted_pages(pages: List[int]) -> List[int]:
         return pages or []
 
 # -----------------------------------------------------------------------------------
-# Ejecución de sección (PDF completo → local → síntesis)
+# Forzar JSON si el modelo devolvió texto no parseable
 # -----------------------------------------------------------------------------------
 def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: str, temperature: Optional[float]):
     schema_hint = ""
@@ -840,10 +740,10 @@ def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: s
     _log_event(section_key or "desconocida", "jsonify", "[NORMALIZADOR JSON]", text, model)
     return _json_loads_robust(text)
 
+# -----------------------------------------------------------------------------------
+# Ejecución de sección (PDF completo → local → síntesis)
+# -----------------------------------------------------------------------------------
 def run_section(section_key: str, model: str, temperature: float, max_chars: int, file_ids: List[str]) -> Tuple[Dict[str, Any], str]:
-    """
-    1º input_file: el modelo lee los PDFs. 2º fallback local. 3º síntesis garantizada (índice/risks).
-    """
     # 1) input_file
     try:
         data = _file_input_section_call(
@@ -862,18 +762,19 @@ def run_section(section_key: str, model: str, temperature: float, max_chars: int
         # 2) Local
         data = _local_singlecall_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
 
-        # 3) Síntesis garantizada si sigue vacío
+        # 3) Síntesis garantizada para índice/risks si sigue vacío
         if section_key in {"indice_tecnico", "riesgos_exclusiones"} and _is_effectively_empty(section_key, data):
             synth = _synthesis_fill_section(section_key, model=model, temperature=temperature)
             if isinstance(synth, dict):
                 data = synth
 
-        # Asegurar índice_propuesto mínimo si el literal no existe
+        # Semilla mínima si aún vacío (índice propuesto estándar)
         if section_key == "indice_tecnico" and _is_effectively_empty(section_key, data):
             data = {
                 "indice_respuesta_tecnica": [],
                 "indice_propuesto": [
                     {"titulo": "Propuesta de valor", "descripcion": None, "subapartados": []},
+                    {"titulo": "Contexto y objetivos", "descripcion": None, "subapartados": []},
                     {"titulo": "Alcance y supuestos", "descripcion": None, "subapartados": []},
                     {"titulo": "Metodología y governance", "descripcion": None, "subapartados": []},
                     {"titulo": "Plan de proyecto (hitos/plazos)", "descripcion": None, "subapartados": []},
@@ -908,7 +809,7 @@ def parse_pdf_cached(name: str, content_bytes: bytes) -> Dict[str, Any]:
     return {"name": name, "pages": pages, "total_chars": total_chars, "hash": _sha256(content_bytes)}
 
 # -----------------------------------------------------------------------------------
-# Sidebar (modelo + temperatura configurable)
+# Sidebar (modelo + temperatura)
 # -----------------------------------------------------------------------------------
 def sidebar_config() -> Tuple[str, float]:
     with st.sidebar:
@@ -925,10 +826,10 @@ def sidebar_config() -> Tuple[str, float]:
                 "Controla la aleatoriedad de la salida.\n\n"
                 "- **Baja (0.0–0.3)**: más determinista/estable (recomendado para pliegos).\n"
                 "- **Media (0.4–0.7)**: equilibrio entre variedad y consistencia.\n"
-                "- **Alta (0.8–1.0)**: más creativa/variada, pero menos estable y con mayor riesgo de ruido."
+                "- **Alta (0.8–1.0)**: más creativa/variada, pero menos estable."
             ),
         )
-        st.caption("Sugerencia: para licitaciones, una temperatura baja (≈0.1–0.3) ofrece resultados más consistentes y pegados al texto.")
+        st.caption("Para licitaciones, usar baja (≈0.1–0.3) mejora consistencia y pegado al texto.")
     return model, float(temperature)
 
 # -----------------------------------------------------------------------------------
@@ -940,6 +841,21 @@ def _badge(text: str):
         f"background:#eef;border:1px solid #ccd;color:#334;font-size:12px'>{text}</span>",
         unsafe_allow_html=True
     )
+
+def _render_index_block(items: List[Dict[str, Any]]):
+    """Muestra título + descripción + subapartados (mejora UX índice técnico)."""
+    if not items:
+        st.info("Sin contenido.")
+        return
+    for i, s in enumerate(items, start=1):
+        titulo = s.get("titulo") or f"Sección {i}"
+        desc = s.get("descripcion")
+        subs = s.get("subapartados") or []
+        st.markdown(f"- **{titulo}**")
+        if desc:
+            st.caption(desc)
+        if subs:
+            st.write("\n".join([f"  • {x}" for x in subs]))
 
 def render_full_view(fs_sections: Dict[str, Any]):
     oc = fs_sections.get("objetivos_contexto", {})
@@ -978,9 +894,9 @@ def render_full_view(fs_sections: Dict[str, Any]):
             if evs:
                 with colA:
                     st.caption("Evidencias")
-                    for e in evs[:3]:
+                    for e in evs[:4]:
                         _badge(f"Pág {e.get('pagina')}")
-                        st.write(f"“{e.get('cita','')[:180]}”")
+                        st.write(f"“{(e.get('cita') or '')[:180]}”")
             if disc:
                 with colB:
                     st.caption("Discrepancias")
@@ -1060,7 +976,7 @@ def render_full_view(fs_sections: Dict[str, Any]):
         else:
             st.info("No se encontraron criterios explícitos.")
 
-    # Índice técnico
+    # Índice técnico (mejor render: título + descripción + subapartados)
     it = fs_sections.get("indice_tecnico", {})
     with st.expander("🗂️ Índice de la respuesta técnica", expanded=False):
         col1, col2 = st.columns(2)
@@ -1068,20 +984,14 @@ def render_full_view(fs_sections: Dict[str, Any]):
         prop = it.get("indice_propuesto") or []
         with col1:
             st.markdown("**Índice solicitado (literal)**")
-            if req:
-                st.write("\n".join([f"- {s.get('titulo')}" for s in req if s.get("titulo")]))
-            else:
-                st.info("Sin índice solicitado detectado.")
+            _render_index_block(req)
         with col2:
             st.markdown("**Índice propuesto (accionable)**")
-            if prop:
-                st.write("\n".join([f"- {s.get('titulo')}" for s in prop if s.get("titulo")]))
-            else:
-                st.info("Sin índice propuesto.")
+            _render_index_block(prop)
         tr = it.get("trazabilidad") or []
         if tr:
             st.caption("Trazabilidad propuesto → solicitado")
-            for t in tr[:8]:
+            for t in tr[:12]:
                 st.write(f"- **{t.get('propuesto')}** → {t.get('solicitado_match') or '—'}")
         disc = it.get("discrepancias") or []
         if disc:
@@ -1241,12 +1151,18 @@ def _markdown_full(fs_sections: Dict[str, Any]) -> str:
     prop = it.get("indice_propuesto") or []
     add("**Solicitado**:")
     if req:
-        for s in req: add(f"- {s.get('titulo')}")
+        for s in req:
+            add(f"- {s.get('titulo')}{': ' + (s.get('descripcion') or '') if s.get('descripcion') else ''}")
+            for sub in s.get("subapartados") or []:
+                add(f"  - {sub}")
     else:
         add("- —")
     add("\n**Propuesto**:")
     if prop:
-        for s in prop: add(f"- {s.get('titulo')}")
+        for s in prop:
+            add(f"- {s.get('titulo')}{': ' + (s.get('descripcion') or '') if s.get('descripcion') else ''}")
+            for sub in s.get("subapartados") or []:
+                add(f"  - {sub}")
     else:
         add("- —")
 
@@ -1346,13 +1262,12 @@ def main():
     tab1, tab2 = st.tabs(["Análisis", "Registro (Prompts/Respuestas)"])
 
     with tab1:
+        # Preparación de PDFs (OpenAI + local)
         if "fs_file_ids" not in st.session_state or st.button("Reindexar PDFs en OpenAI", use_container_width=True):
             st.session_state.pop("fs_sections", None)
 
-            # Clonar bytes (Streamlit 'lee' el buffer)
             uploaded = [{"name": f.name, "bytes": f.read()} for f in files]
 
-            # Subir a OpenAI como files (purpose=assistants)
             with st.spinner("Subiendo PDF(s) a OpenAI…"):
                 file_ids = []
                 for u in uploaded:
@@ -1362,7 +1277,6 @@ def main():
                     )
                     file_ids.append(up.id)
 
-            # Texto local cacheado (diagnóstico y fallback)
             local_docs, char_stats = [], []
             for u in uploaded:
                 parsed = parse_pdf_cached(u["name"], u["bytes"])
@@ -1382,7 +1296,7 @@ def main():
                 if nchar < 1000:
                     st.warning(f"{name}: muy poco texto (posible escaneado sin OCR).")
 
-        # Estado
+        # Estado de ejecución
         st.session_state.setdefault("busy", False)
         st.session_state.setdefault("job", None)
         st.session_state.setdefault("job_all", False)
@@ -1418,7 +1332,7 @@ def main():
             st.button("🔎 Análisis Completo", type="primary", use_container_width=True, disabled=dis,
                       on_click=_start_job, kwargs={"do_all": True})
 
-        # Ejecución
+        # Ejecución (con status)
         if st.session_state["busy"]:
             with st.status("Procesando análisis…", expanded=True) as status:
                 try:
@@ -1490,13 +1404,18 @@ def main():
                     use_container_width=True,
                 )
 
-    # Registro de prompts/respuestas
+    # Registro de prompts/respuestas (incluye Formato y Entrega)
     with tab2:
         st.caption("Vista de auditoría: prompt enviado y respuesta del modelo por sección/fase.")
         _log_init()
-        for k, v in st.session_state["logs"].items():
+        st.button("🔄 Reinicializar/Normalizar listado de secciones", on_click=_log_init)
+
+        # Mostrar en orden fijo (incluye formato_oferta)
+        ordered = list(SECTION_SPECS.keys())
+        for k in ordered:
             spec = SECTION_SPECS.get(k, {"titulo": k})
-            with st.expander(f"🧭 {spec['titulo']} ({k})", expanded=False):
+            v = st.session_state["logs"].get(k, [])
+            with st.expander(f"🧭 {spec['titulo']} ({k}) — {len(v)} eventos", expanded=False):
                 if not v:
                     st.info("Sin logs para esta sección todavía.")
                     continue
