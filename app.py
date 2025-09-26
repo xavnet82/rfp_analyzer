@@ -506,15 +506,17 @@ def main():
             except KeyError:
                 pass
             with st.spinner("Indexando PDFs en OpenAI (Vector Store)..."):
-                vs_id = create_vector_store_from_streamlit_files(files, name="RFP Vector Store")
+                vs_id, file_ids = create_vector_store_from_streamlit_files(files, name="RFP Vector Store")
             st.session_state["fs_vs_id"] = vs_id
+            st.session_state["fs_file_ids"] = file_ids
             st.success("PDF(s) indexados en OpenAI.")
-
+        
         vs_id = st.session_state.get("fs_vs_id")
+        file_ids = st.session_state.get("fs_file_ids", [])
         if not vs_id:
             st.stop()
-
-        st.info(f"Vector Store listo: `{vs_id}`")
+        
+        st.info(f"Vector Store listo: `{vs_id}` con {len(file_ids)} archivo(s)")
 
         # (2) Botonera de secciones
         st.subheader("Análisis por secciones")
