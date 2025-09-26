@@ -18,8 +18,8 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
     "objetivos_contexto": {
         "titulo": "Objetivos y contexto",
         "user_prompt": (
-            "Extrae objetivos y contexto del pliego. Devuelve SIEMPRE las claves listadas. "
-            "Amplía el contexto incluyendo objeto del contrato, duración, lotes y CPV si aparecieran.\n"
+            "Extrae detalle estratégico, objetivos y contexto del cliente identificado en el pliego. Devuelve SIEMPRE las claves listadas. "
+            "Amplía el contexto incluyendo objeto del contrato, duración, lotes, prorrogas, etc y CPV si aparecieran.\n"
             "Salida JSON EXACTA con claves:\n"
             "{"
             '  "resumen_servicios": str|null,'
