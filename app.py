@@ -48,7 +48,6 @@ def login():
             if u == admin_user and p == admin_pass:
                 st.session_state["auth"] = True
                 st.success("Acceso concedido.")
-                st.rerun()
             else:
                 st.error("Credenciales inválidas.")
     st.stop()
@@ -238,9 +237,15 @@ def main():
     st.title(APP_TITLE)
     with st.sidebar:
         model = st.selectbox("Modelo OpenAI", AVAILABLE_MODELS, index=0)
-        temperature = st.slider(
-            "Temperatura", 0.0, 1.0, DEFAULT_TEMPERATURE, 0.05,
-            help=("Baja=determinista; Alta=creativa. Para pliegos, 0.1–0.3 recomendado.")
+        verbosity = st.slider(
+            "Nivel de detalle de las respuestas",
+            1, 5, 3,
+            help=(
+                "1 = muy ejecutivo y rápido (resúmenes cortos); 3 = equilibrio; 5 = muy detallado (más ejemplos, tablas y justificación)."
+            ),
+        )
+        # Temperatura oculta (determinista)
+        temperature = DEFAULT_TEMPERATURE
         )
 
     _logs_init()
