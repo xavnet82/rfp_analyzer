@@ -1,6 +1,6 @@
 # app.py
 import os, sys, io, json, re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 # Asegura que la raíz del proyecto está en el path de importación
 ROOT = os.path.dirname(__file__)
@@ -20,19 +20,23 @@ from config import (
     ADMIN_PASSWORD,
     MAX_TOKENS_PER_REQUEST,
 )
+
+# Servicios locales ya existentes
 from services.pdf_loader import extract_pdf_text
 from services.schema import OfertaAnalizada
-from services.openai_client import analyze_text_chunk, merge_offers  # modo chunking local
+from services.openai_client import analyze_text_chunk, merge_offers
 from utils.text import clean_text, chunk_text
 from components.ui import render_header, render_result
 
-# Configuración de la página (una sola vez)
+# ---------------------------------------------------------------------
+# Página
+# ---------------------------------------------------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 
-# =============================================================================
-# Utilidades de autenticación
-# =============================================================================
+# ---------------------------------------------------------------------
+# Login
+# ---------------------------------------------------------------------
 def login_gate():
     """Bloquea la UI hasta hacer login; mantiene botón de logout en la sidebar."""
     if st.session_state.get("is_auth", False):
@@ -57,10 +61,9 @@ def login_gate():
     st.stop()
 
 
-# =============================================================================
-# Utilidades OpenAI – File Search (Responses API)
-# Implementadas localmente para que no dependas de otros módulos
-# =============================================================================
+# ---------------------------------------------------------------------
+# OpenAI (Responses) – utilidades robustas
+# ---------------------------------------------------------------------
 if not OPENAI_API_KEY:
     st.error("No se encontró OPENAI_API_KEY. Configura `.env`, variables de entorno o `st.secrets`.")
     st.stop()
@@ -94,11 +97,9 @@ def _json_loads_robust(raw: Any) -> Any:
         return json.loads(brace)
 
 def _coalesce_text_from_responses(rsp) -> Optional[str]:
-    # 1) SDK recientes
     txt = getattr(rsp, "output_text", None)
     if txt:
         return txt
-    # 2) Recorrer bloques (output / content / text)
     out = getattr(rsp, "output", None)
     if out:
         parts = []
@@ -123,17 +124,16 @@ def _is_temperature_error(e: Exception) -> bool:
 
 def _is_unsupported_param(e: Exception, param: str) -> bool:
     s = str(e)
-    return ("unsupported_parameter" in s or "Unexpected" in s or "unexpected" in s) and (param in s)
+    return ("unsupported_parameter" in s or "Unexpected" in s or "unexpected" in s or "Unknown parameter" in s) and (param in s)
 
 def _responses_create_robust(args: dict):
     """
     Llama a Responses API y se auto-adapta a variaciones del SDK/endpoint:
     - quita temperature si el modelo lo rechaza,
-    - quita response_format si el SDK no lo soporta,
+    - quita response_format si el SDK/endpoint no lo soporta,
     - cambia max_output_tokens -> max_completion_tokens,
-    - mueve tool_resources/attachments/tools a extra_body si el SDK no acepta esos kwargs.
+    - mueve tools/attachments a extra_body si el SDK no los acepta como kwargs.
     """
-    # separamos posibles extra_body preexistentes
     a = dict(args)
     extra = a.pop("extra_body", {}) or {}
 
@@ -146,12 +146,12 @@ def _responses_create_robust(args: dict):
         except (BadRequestError, TypeError) as e:
             s = str(e)
 
-            # 1) temperature no soportado
+            # 1) temperature
             if _is_temperature_error(e) or ("unexpected keyword" in s and "temperature" in s):
                 a.pop("temperature", None)
                 continue
 
-            # 2) response_format no soportado
+            # 2) response_format
             if _is_unsupported_param(e, "response_format") or ("unexpected keyword" in s and "response_format" in s):
                 a.pop("response_format", None)
                 continue
@@ -163,28 +163,21 @@ def _responses_create_robust(args: dict):
                     a["max_completion_tokens"] = val
                 continue
 
-            # 4) tool_resources como kw no soportado -> mover a extra_body
-            if _is_unsupported_param(e, "tool_resources") or ("unexpected keyword" in s and "tool_resources" in s):
-                tr = a.pop("tool_resources", None)
-                if tr is not None:
-                    extra["tool_resources"] = tr
-                continue
-
-            # 5) attachments como kw no soportado -> mover a extra_body
+            # 4) attachments: mover a extra_body si el SDK no lo acepta como kw
             if _is_unsupported_param(e, "attachments") or ("unexpected keyword" in s and "attachments" in s):
                 att = a.pop("attachments", None)
                 if att is not None:
                     extra["attachments"] = att
                 continue
 
-            # 6) tools como kw no soportado -> mover a extra_body
+            # 5) tools: mover a extra_body si el SDK no lo acepta como kw
             if _is_unsupported_param(e, "tools") or ("unexpected keyword" in s and "tools" in s):
                 tools = a.pop("tools", None)
                 if tools is not None:
                     extra["tools"] = tools
                 continue
 
-            # Otro error real -> propaga
+            # errores de servidor por parámetros desconocidos: propaga para que el caller active fallback
             raise
 
 
@@ -212,7 +205,9 @@ def create_vector_store_from_streamlit_files(files, name: str = "RFP Vector Stor
     return store.id, file_ids
 
 
-# ---- Secciones: prompts específicos ----
+# ---------------------------------------------------------------------
+# Secciones (prompts específicos para File Search)
+# ---------------------------------------------------------------------
 SECTION_SPECS: Dict[str, Dict[str, str]] = {
     "objetivos_contexto": {
         "titulo": "Objetivos y contexto",
@@ -224,8 +219,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
             '  "objetivos": [str],\n'
             '  "alcance": str|null,\n'
             '  "referencias_paginas": [int]\n'
-            "}\n"
-            "Usa números de página cuando sea posible."
+            "}"
         ),
     },
     "servicios": {
@@ -238,7 +232,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
             '  "servicios_detalle": [{"nombre": str, "descripcion": str|null}],\n'
             '  "alcance": str|null,\n'
             '  "referencias_paginas": [int]\n'
-            "}\n"
+            "}"
         ),
     },
     "importe": {
@@ -251,7 +245,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
             '  "importes_detalle": [{"concepto": str|null, "importe": float|null, "moneda": str|null, "observaciones": str|null}],\n'
             '  "referencias_paginas": [int]\n'
             "}\n"
-            "Usa punto decimal. Si hay varios importes (base, IVA, prórrogas, anualidades), inclúyelos en importes_detalle."
+            "Usa punto decimal. Si hay base/IVA/prórrogas/anualidades, inclúyelos."
         ),
     },
     "criterios_valoracion": {
@@ -265,7 +259,6 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
             '  ],\n'
             '  "referencias_paginas": [int]\n'
             "}\n"
-            "Normaliza pesos a escala máxima si el pliego lo indica (p.ej. total 100)."
         ),
     },
     "indice_tecnico": {
@@ -313,12 +306,13 @@ SYSTEM_PREFIX = (
     "Si algo no aparece en los PDFs, devuelve null o listas vacías."
 )
 
+
 def _file_search_section_call(
-    vector_store_id: str,                 # se mantiene por compat, pero no lo usaremos aquí
+    vector_store_id: str,                 # no usado aquí, se mantiene por compatibilidad
     user_prompt: str,
     model: str,
     temperature: Optional[float] = None,
-    file_ids: Optional[list[str]] = None,
+    file_ids: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Lanza una llamada a Responses+FileSearch para una sección concreta y devuelve dict.
@@ -326,9 +320,7 @@ def _file_search_section_call(
     Usamos 'attachments' + 'tools' (y _responses_create_robust lo moverá a extra_body si hace falta).
     """
     if not file_ids:
-        raise RuntimeError(
-            "No hay file_ids para adjuntar a la llamada. Reindexa los PDFs para obtenerlos."
-        )
+        raise RuntimeError("No hay file_ids para adjuntar a la llamada. Reindexa los PDFs.")
 
     model = (model or OPENAI_MODEL).strip()
     is_gpt5 = model.lower().startswith("gpt-5")
@@ -339,8 +331,7 @@ def _file_search_section_call(
     args = dict(
         model=model,
         input=[sys_msg, usr_msg],
-        tools=[{"type": "file_search"}],  # habilita la herramienta de búsqueda
-        # Adjuntamos los PDFs con permiso explícito para file_search
+        tools=[{"type": "file_search"}],  # habilita la herramienta
         attachments=[{"file_id": fid, "tools": [{"type": "file_search"}]} for fid in file_ids],
         response_format={"type": "json_object"},
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
@@ -348,7 +339,7 @@ def _file_search_section_call(
     if temperature is not None:
         args["temperature"] = float(temperature)
     if is_gpt5:
-        # Muchos gpt-5* rechazan temp != 1 y response_format
+        # Muchos despliegues gpt-5* rechazan temp != 1 y response_format
         args.pop("temperature", None)
         args.pop("response_format", None)
 
@@ -360,11 +351,110 @@ def _file_search_section_call(
     return _json_loads_robust(text)
 
 
+# ---------------------------------------------------------------------
+# Fallback local por secciones (si el endpoint no admite File Search)
+# ---------------------------------------------------------------------
+def analyze_chunk_safe(current_result, ch_text, model, temperature):
+    """Compat con firmas antiguas de analyze_text_chunk."""
+    try:
+        return analyze_text_chunk(current_result, ch_text, model=model, temperature=temperature)
+    except TypeError:
+        return analyze_text_chunk(current_result, ch_text, model=model)
+
+def _fallback_local_section(section_key: str, model: str, temperature: float, max_chars: int):
+    """
+    Fallback robusto: analiza localmente por chunks con analyze_text_chunk (pipeline existente)
+    y devuelve un dict con la forma esperada por la sección.
+    """
+    docs = st.session_state.get("fs_local_docs", [])
+    if not docs:
+        raise RuntimeError("No hay texto local para fallback. Reindexa los PDFs.")
+
+    # Construimos chunks según el slider actual
+    all_chunks: List[str] = []
+    for d in docs:
+        chunks = chunk_text(d["pages"], max_chars=max_chars)
+        all_chunks.extend(chunks)
+
+    # Pasada de análisis global con tu pipeline existente
+    result = None
+    for ch in all_chunks:
+        result = analyze_chunk_safe(result, ch, model=model, temperature=temperature)
+
+    # Map al JSON esperado por cada sección
+    if section_key == "objetivos_contexto":
+        return {
+            "resumen_servicios": result.resumen_servicios,
+            "objetivos": result.objetivos,
+            "alcance": result.alcance,
+            "referencias_paginas": result.referencias_paginas,
+        }
+    elif section_key == "servicios":
+        return {
+            "resumen_servicios": result.resumen_servicios,
+            "servicios_detalle": [],
+            "alcance": result.alcance,
+            "referencias_paginas": result.referencias_paginas,
+        }
+    elif section_key == "importe":
+        return {
+            "importe_total": result.importe_total,
+            "moneda": result.moneda,
+            "importes_detalle": [d.model_dump() for d in result.importes_detalle],
+            "referencias_paginas": result.referencias_paginas,
+        }
+    elif section_key == "criterios_valoracion":
+        return {
+            "criterios_valoracion": [c.model_dump() for c in result.criterios_valoracion],
+            "referencias_paginas": result.referencias_paginas,
+        }
+    elif section_key == "indice_tecnico":
+        return {
+            "indice_respuesta_tecnica": [s.model_dump() for s in result.indice_respuesta_tecnica],
+            "indice_propuesto": [s.model_dump() for s in result.indice_propuesto],
+            "referencias_paginas": result.referencias_paginas,
+        }
+    elif section_key == "riesgos_exclusiones":
+        return {
+            "riesgos_y_dudas": result.riesgos_y_dudas,
+            "exclusiones": [],
+            "referencias_paginas": result.referencias_paginas,
+        }
+    elif section_key == "solvencia":
+        return {
+            "solvencia": {"tecnica": [], "economica": [], "administrativa": []},
+            "referencias_paginas": result.referencias_paginas,
+        }
+    else:
+        return {"mensaje": "Sección no reconocida", "section_key": section_key}
+
+def _run_section_with_fallback(section_key: str, vs_id: str, file_ids: List[str], model: str, temperature: float, max_chars: int):
+    """
+    Intenta File Search. Si el servidor rechaza parámetros (Unknown parameter: attachments/tool_resources),
+    cae a fallback local por chunks.
+    """
+    spec = SECTION_SPECS[section_key]
+    try:
+        data = _file_search_section_call(
+            vector_store_id=vs_id,
+            user_prompt=spec["user_prompt"],
+            model=model,
+            temperature=temperature,
+            file_ids=file_ids,
+        )
+        return data, "file_search"
+    except Exception as e:
+        msg = str(e)
+        if ("Unknown parameter: 'attachments'" in msg) or ("Unknown parameter: 'tool_resources'" in msg) \
+           or ("unknown_parameter" in msg) or ("unsupported" in msg.lower()):
+            data = _fallback_local_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
+            return data, "local_fallback"
+        raise
 
 
-# =============================================================================
-# Utilidades UI y Sidebar
-# =============================================================================
+# ---------------------------------------------------------------------
+# Sidebar (config)
+# ---------------------------------------------------------------------
 def sidebar_config():
     """Dibuja la configuración en sidebar y devuelve (model, temperature, max_chars, mode)."""
     with st.sidebar:
@@ -400,7 +490,7 @@ def sidebar_config():
             "Modo de análisis",
             ["Chunking local", "PDF completo (File Search)"],
             index=0,
-            help="File Search sube los PDF a OpenAI y los reutiliza en varias consultas sin reenviar texto."
+            help="File Search sube los PDF a OpenAI y los reutiliza en varias consultas; si no está disponible, la app hará fallback local."
         )
 
         # Chunking local: tamaño de chunk
@@ -413,24 +503,12 @@ def sidebar_config():
             "Nota: algunos modelos (p.ej., gpt-5*) ignoran temperaturas ≠ 1.0; el cliente se autoajusta."
         )
 
-        if not OPENAI_API_KEY:
-            st.error("No se encontró OPENAI_API_KEY. Configura `.env`, variables de entorno o `st.secrets`.")
-            st.stop()
-
     return model, temperature, max_chars, mode
 
 
-def analyze_chunk_safe(current_result, ch_text, model, temperature):
-    """Compat con firmas antiguas: reintenta sin 'temperature' si el servicio no lo acepta."""
-    try:
-        return analyze_text_chunk(current_result, ch_text, model=model, temperature=temperature)
-    except TypeError:
-        return analyze_text_chunk(current_result, ch_text, model=model)
-
-
-# =============================================================================
+# ---------------------------------------------------------------------
 # App principal
-# =============================================================================
+# ---------------------------------------------------------------------
 def main():
     # 1) Login
     login_gate()
@@ -450,9 +528,9 @@ def main():
         st.info("Sube al menos un PDF para comenzar el análisis.")
         st.stop()
 
-    # ======================================
-    # A) Modo Chunking local (como antes)
-    # ======================================
+    # =========================================================
+    # A) Modo Chunking local (pipeline existente)
+    # =========================================================
     if mode == "Chunking local":
         docs = []
         total_chunks = 0
@@ -503,26 +581,52 @@ def main():
             st.session_state["per_file_results"] = per_file_results
             st.session_state["aggregate_result"] = aggregate_result
 
-    # ======================================
-    # B) Modo PDF completo (File Search)
-    # ======================================
+    # =========================================================
+    # B) Modo PDF completo (File Search) + Fallback local
+    # =========================================================
     else:
-        # (1) Preparar/crear Vector Store (solo 1 vez por subida)
+        # (1) Preparar/crear Vector Store (solo 1 vez por subida) y capturar texto local para fallback
         if "fs_vs_id" not in st.session_state or st.button("Reindexar PDFs en OpenAI"):
-            # limpia resultados anteriores
             st.session_state.pop("fs_sections", None)
+
+            # Leemos los PDFs a memoria UNA vez
+            uploaded = [{"name": f.name, "bytes": f.read()} for f in files]
+
+            # Wrapper para usar create_vector_store_from_streamlit_files
+            class _MemFile:
+                def __init__(self, name, data):
+                    self.name = name
+                    self._data = data
+                def read(self):
+                    return self._data
+
+            mem_files = [_MemFile(u["name"], u["bytes"]) for u in uploaded]
+
             with st.spinner("Indexando PDFs en OpenAI (Vector Store)..."):
-                vs_id, file_ids = create_vector_store_from_streamlit_files(files, name="RFP Vector Store")
+                vs_id, file_ids = create_vector_store_from_streamlit_files(mem_files, name="RFP Vector Store")
+
+            # Guardamos ids y también el TEXTO local (para fallback)
+            local_docs = []
+            for u in uploaded:
+                pages, _ = extract_pdf_text(io.BytesIO(u["bytes"]))
+                pages = [clean_text(p) for p in pages]
+                local_docs.append({
+                    "name": u["name"],
+                    "pages": pages,
+                })
+
             st.session_state["fs_vs_id"] = vs_id
             st.session_state["fs_file_ids"] = file_ids
-            st.success("PDF(s) indexados en OpenAI.")
-        
+            st.session_state["fs_local_docs"] = local_docs
+            st.success("PDF(s) indexados en OpenAI y texto local preparado.")
+
         vs_id = st.session_state.get("fs_vs_id")
         file_ids = st.session_state.get("fs_file_ids", [])
+        local_docs = st.session_state.get("fs_local_docs", [])
         if not vs_id:
             st.stop()
-        
-        st.info(f"Vector Store listo: `{vs_id}` con {len(file_ids)} archivo(s)")
+
+        st.info(f"Vector Store listo: `{vs_id}` – {len(file_ids)} archivo(s) adjuntables")
 
         # (2) Botonera de secciones
         st.subheader("Análisis por secciones")
@@ -537,24 +641,28 @@ def main():
             b_risk = st.button("Riesgos y exclusiones")
         with c3:
             b_solv = st.button("Criterios de solvencia")
-            # espacio para futuros botones
             st.write("")
 
         if "fs_sections" not in st.session_state:
             st.session_state["fs_sections"] = {}
 
-        # (3) Ejecutar sección solicitada
+        # (3) Ejecutar sección solicitada (con fallback automático)
         def run_section(section_key: str):
             spec = SECTION_SPECS[section_key]
             with st.spinner(f"Analizando sección: {spec['titulo']}..."):
-                data = _file_search_section_call(
-                    vector_store_id=vs_id,
-                    user_prompt=spec["user_prompt"],
+                data, mode_used = _run_section_with_fallback(
+                    section_key=section_key,
+                    vs_id=vs_id,
+                    file_ids=file_ids,
                     model=model,
                     temperature=temperature,
-                    file_ids=file_ids,   # <--- importante
+                    max_chars=max_chars,
                 )
             st.session_state["fs_sections"][section_key] = data
+            if mode_used == "local_fallback":
+                st.warning(f"Sección '{spec['titulo']}' analizada con **fallback local** (el endpoint no admite File Search en Responses).")
+            else:
+                st.info(f"Sección '{spec['titulo']}' analizada con **File Search**.")
 
         if b_obj:  run_section("objetivos_contexto")
         if b_serv: run_section("servicios")
@@ -577,10 +685,9 @@ def main():
                         mime="application/json",
                     )
 
-        # (5) (Opcional) Fusionar a un resultado agregado del esquema principal
+        # (5) (Opcional) Construir resultado agregado con el esquema principal
         if st.session_state["fs_sections"]:
             if st.button("Construir resultado agregado (map a esquema principal)"):
-                # Mapear las secciones que encajan directamente en OfertaAnalizada
                 payload: Dict[str, Any] = {
                     "resumen_servicios": "",
                     "objetivos": [],
@@ -603,7 +710,7 @@ def main():
                 payload["alcance"] = oc.get("alcance") or payload["alcance"]
                 payload["referencias_paginas"] += oc.get("referencias_paginas", [])
 
-                # servicios: solo añadimos resumen/alcance; el detalle queda fuera del esquema principal
+                # servicios
                 sv = sec.get("servicios", {})
                 if isinstance(sv.get("resumen_servicios"), str) and len(sv["resumen_servicios"]) > len(payload["resumen_servicios"]):
                     payload["resumen_servicios"] = sv["resumen_servicios"]
@@ -630,7 +737,6 @@ def main():
 
                 # riesgos/exclusiones
                 rx = sec.get("riesgos_exclusiones", {})
-                # concatenamos exclusiones dentro de riesgos_y_dudas si existen
                 ry = rx.get("riesgos_y_dudas")
                 ex = rx.get("exclusiones", [])
                 if ry or ex:
@@ -644,7 +750,6 @@ def main():
                 except Exception:
                     payload["referencias_paginas"] = []
 
-                # Validar contra esquema principal
                 try:
                     result = OfertaAnalizada.model_validate(payload)
                     st.session_state["aggregate_result"] = result
@@ -652,13 +757,12 @@ def main():
                 except Exception as e:
                     st.error(f"No fue posible validar contra el esquema principal: {e}")
 
-    # ======================================
-    # Visualización y descargas (común)
-    # ======================================
+    # =========================================================
+    # Visualización común (agregado / por fichero local)
+    # =========================================================
     per_file_results = st.session_state.get("per_file_results", {})
     aggregate_result = st.session_state.get("aggregate_result", None)
 
-    # Vista de resultados (cuando hay agregado o por fichero del modo local)
     if aggregate_result is not None or per_file_results:
         options = ["Agregado (todos)"] + list(per_file_results.keys())
         choice = st.selectbox("Vista de resultados (modo chunking local / agregado File Search)", options)
@@ -671,7 +775,6 @@ def main():
             if isinstance(r, OfertaAnalizada):
                 render_result(r)
 
-        # Exportaciones de agregado (si existe)
         if isinstance(aggregate_result, OfertaAnalizada):
             with st.expander("Descargas del resultado agregado"):
                 st.download_button(
