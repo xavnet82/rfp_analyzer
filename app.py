@@ -492,14 +492,13 @@ def main():
     else:
         # (1) Preparar/crear Vector Store (solo 1 vez por subida)
         if "fs_vs_id" not in st.session_state or st.button("Reindexar PDFs en OpenAI"):
-            try:
-                st.session_state.pop("fs_sections", None)  # limpia resultados anteriores
-            except KeyError:
-                pass
-                with st.spinner("Indexando PDFs en OpenAI (Vector Store)..."):
-                    vs_id, file_ids = create_vector_store_from_streamlit_files(files, name="RFP Vector Store")
-                st.session_state["fs_vs_id"] = vs_id
-                st.session_state["fs_file_ids"] = file_ids
+            # limpia resultados anteriores
+            st.session_state.pop("fs_sections", None)
+            with st.spinner("Indexando PDFs en OpenAI (Vector Store)..."):
+                vs_id, file_ids = create_vector_store_from_streamlit_files(files, name="RFP Vector Store")
+            st.session_state["fs_vs_id"] = vs_id
+            st.session_state["fs_file_ids"] = file_ids
+            st.success("PDF(s) indexados en OpenAI.")
         
         vs_id = st.session_state.get("fs_vs_id")
         file_ids = st.session_state.get("fs_file_ids", [])
