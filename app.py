@@ -341,7 +341,7 @@ def main():
                 st.markdown(f"**Alcance:** {oc.get('alcance') or '—'}")
                 if oc.get('referencias_paginas'):
                     st.markdown("**Referencias de páginas:**")
-                    st.markdown(bullets([str(x) for x in (oc.get('referencias_paginas') or [])]))
+                    st.markdown(([str(x) for x in (oc.get('referencias_paginas') or [])]))
                 render_extra_fields("Detalles adicionales (objetivos/contexto)", oc, {'resumen_servicios','objetivos','alcance','referencias_paginas'})
 
 
