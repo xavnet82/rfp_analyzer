@@ -138,8 +138,8 @@ def _fallback_extract_pdf_text(file_like: io.BytesIO) -> Tuple[List[str], str]:
                 # OCR best-effort; keep PyPDF2 text if OCR fails
                 pass
 
-        return pages, "\n".join(pages)
-        
+        return pages, "
+".join(pages)".join(pages)
     except Exception as e:
         raise RuntimeError(f"Fallo al parsear PDF (fallback): {e}")
 try:
@@ -403,7 +403,24 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
 # -----------------------------------------------------------------------------------
 SECTION_KEYWORDS = {
   "objetivos_contexto": {"objeto del contrato": 5, "objeto": 3, "alcance": 4, "objetivo": 3,
-                         "contexto": 3, "descripción del servicio": 4, "alcances": 3},
+                         "contexto": 3, "descripción del servicio": 4, "alcances": 3
+    ,
+"resumen_ejecutivo": {
+    "duración del contrato": 5,
+    "plazo de ejecución": 5,
+    "vigencia": 3,
+    "periodo de ejecución": 4,
+    "periodo de prestación": 3,
+    "prórrogas": 2,
+    "fecha límite de presentación": 5,
+    "plazo de presentación de ofertas": 5,
+    "fecha y hora de presentación": 5,
+    "presentación de proposiciones": 4,
+    "fecha tope de entrega": 4,
+    "sobres electrónicos": 2,
+    "licitación electrónica": 2
+}
+},
   "servicios": {"servicios": 5, "actividades": 4, "tareas": 4, "entregables": 4,
                 "nivel de servicio": 4, "sla": 3, "kpi": 3, "periodicidad": 3, "volumen": 3},
   "importe": {"presupuesto base": 6, "importe": 5, "precio": 4, "iva": 4,
