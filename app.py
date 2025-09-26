@@ -13,14 +13,14 @@ from prompts.specs import SYSTEM_PREFIX, SECTION_SPECS, SECTION_CONTEXT_TUNING, 
 from utils.text import clean_text, bullets
 from ui.render import render_index, resumen_ejecutivo
 
-APP_TITLE = "Accenture RFP Analyzer"
+APP_TITLE = "RFP Analyzer (Consultoría TI)"
 AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini"]
 DEFAULT_TEMPERATURE = 0.2
 LOCAL_CONTEXT_MAX_CHARS = 40000
 MAX_TOKENS_PER_REQUEST = 1800
 
 # Verbosidad → tokens/contexto
-VERBOSITY_TOKENS = {1: 800, 2: 1200, 3: 1800, 4: 2500, 5: 4000}
+VERBOSITY_TOKENS = {1: 700, 2: 1000, 3: 1400, 4: 1800, 5: 2200}
 VERBOSITY_CTX_MULT = {1: 0.6, 2: 0.8, 3: 1.0, 4: 1.2, 5: 1.4}
 
 
@@ -48,7 +48,6 @@ def login():
             if u == admin_user and p == admin_pass:
                 st.session_state["auth"] = True
                 st.success("Acceso concedido.")
-                st.rerun()
             else:
                 st.error("Credenciales inválidas.")
     st.stop()
@@ -247,7 +246,7 @@ def main():
         )
         # Temperatura oculta (determinista)
         temperature = DEFAULT_TEMPERATURE
-        
+        )
 
     _logs_init()
 
@@ -345,21 +344,23 @@ def main():
                     st.markdown(bullets([str(x) for x in (oc.get('referencias_paginas') or [])]))
                 render_extra_fields("Detalles adicionales (objetivos/contexto)", oc, {'resumen_servicios','objetivos','alcance','referencias_paginas'})
 
+
             # --------- Servicios ---------
             svs = fs_sections.get("servicios", {})
-            with st.expander("🧩 Servicios solicitados (detalle)"):
+            with st.expander("🧩 Servicios solicitados (detalle)", expanded=True):
                 st.markdown(f"**Resumen:** {svs.get('resumen_servicios') or '—'}")
                 detalle = svs.get("servicios_detalle") or []
                 if detalle:
                     try:
                         import pandas as pd
+                        # Tabla resumen compacta
                         rows = []
                         for d in detalle:
                             rows.append({
                                 "Servicio": d.get("nombre"),
-                                "Descripción": d.get("descripcion"),
-                                "Entregables": ", ".join(d.get("entregables") or []),
-                                "SLA/KPI": ", ".join([sk.get("nombre") for sk in (d.get("sla_kpi") or []) if sk.get("nombre")]),
+                                "Descripción (resumen)": (d.get("descripcion") or "")[:120] + ("…" if (d.get("descripcion") and len(d.get("descripcion"))>120) else ""),
+                                "Entregables (n)": len(d.get("entregables") or []),
+                                "SLA/KPI (n)": len(d.get("sla_kpi") or []),
                                 "Periodicidad": d.get("periodicidad"),
                                 "Volumen": d.get("volumen"),
                                 "Ubicación": d.get("ubicacion_modalidad"),
@@ -368,9 +369,140 @@ def main():
                     except Exception:
                         for d in detalle:
                             st.markdown(f"- **{d.get('nombre')}** — {d.get('descripcion') or ''}")
+
+                    # Vista detallada por servicio
+                    st.markdown("**Detalle por servicio**")
+                    for d in detalle:
+                        with st.expander(f"• {d.get('nombre') or 'Servicio'}", expanded=False):
+                            tabs_srv = st.tabs([
+                                "Resumen",
+                                "Tareas/Actividades",
+                                "Entregables",
+                                "SLA/KPI",
+                                "Criterios de aceptación",
+                                "Roles y perfiles",
+                                "Gobernanza/Reporting",
+                                "Herramientas",
+                                "Transición",
+                                "Fuera de alcance / Supuestos",
+                            ])
+                            # Resumen
+                            with tabs_srv[0]:
+                                st.markdown(f"**Descripción:** {d.get('descripcion') or '—'}")
+                                colA, colB = st.columns(2)
+                                with colA:
+                                    st.markdown(f"- **Periodicidad:** {d.get('periodicidad') or '—'}")
+                                    st.markdown(f"- **Volumen:** {d.get('volumen') or '—'}")
+                                    st.markdown(f"- **Ubicación/Modalidad:** {d.get('ubicacion_modalidad') or '—'}")
+                                with colB:
+                                    horario = d.get("horario") or {}
+                                    st.markdown("**Horario:**")
+                                    st.markdown(f"- Jornada: {horario.get('jornada') or '—'}")
+                                    vs = horario.get("ventanas_servicio") or []
+                                    if vs:
+                                        st.markdown("**Ventanas de servicio:**")
+                                        st.markdown(bullets(vs))
+                            # Tareas / Actividades
+                            with tabs_srv[1]:
+                                t = d.get("tareas") or []
+                                a = d.get("actividades") or []
+                                if t: st.markdown("**Tareas**"); st.markdown(bullets(t))
+                                if a: st.markdown("**Actividades**"); st.markdown(bullets(a))
+                                if not (t or a): st.info("Sin tareas/actividades explícitas.")
+                            # Entregables
+                            with tabs_srv[2]:
+                                ent = d.get("entregables") or []
+                                if ent: st.markdown(bullets(ent))
+                                else: st.info("Sin entregables explícitos.")
+                            # SLA/KPI
+                            with tabs_srv[3]:
+                                sla = d.get("sla_kpi") or []
+                                if sla:
+                                    try:
+                                        import pandas as pd
+                                        rows = []
+                                        for s in sla:
+                                            rows.append({
+                                                "Nombre": s.get("nombre"),
+                                                "Objetivo": s.get("objetivo"),
+                                                "Unidad": s.get("unidad"),
+                                                "Método medición": s.get("metodo_medicion"),
+                                                "Frecuencia": s.get("frecuencia"),
+                                                "Penalizaciones": s.get("penalizaciones"),
+                                            })
+                                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                                    except Exception:
+                                        for s in sla:
+                                            st.markdown(f"- **{s.get('nombre')}** — objetivo: {s.get('objetivo') or '—'}, frecuencia: {s.get('frecuencia') or '—'}")
+                                else:
+                                    st.info("Sin SLA/KPI explícitos.")
+                            # Criterios de aceptación
+                            with tabs_srv[4]:
+                                ca = d.get("criterios_aceptacion") or []
+                                if ca: st.markdown(bullets(ca))
+                                else: st.info("Sin criterios de aceptación explícitos.")
+                            # Roles y perfiles
+                            with tabs_srv[5]:
+                                rp = d.get("roles_perfiles") or []
+                                if rp:
+                                    try:
+                                        import pandas as pd
+                                        rows = []
+                                        for r in rp:
+                                            rows.append({
+                                                "Rol": r.get("rol"),
+                                                "Seniority": r.get("seniority"),
+                                                "FTE mínimo": r.get("fte_min"),
+                                                "Certificaciones": ", ".join(r.get("certificaciones") or []),
+                                            })
+                                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                                    except Exception:
+                                        for r in rp:
+                                            st.markdown(f"- {r.get('rol')} — {r.get('seniority') or ''} (FTE: {r.get('fte_min') or '—'})")
+                                else:
+                                    st.info("Sin requisitos de perfiles explícitos.")
+                            # Gobernanza / Reporting
+                            with tabs_srv[6]:
+                                gob = d.get("gobernanza_reportes") or {}
+                                comites = gob.get("comites") or []
+                                if comites:
+                                    st.markdown("**Comités**")
+                                    st.markdown(bullets(comites))
+                                st.markdown(f"**Periodicidad de reportes:** {gob.get('periodicidad_reportes') or '—'}")
+                                plant = gob.get("plantillas") or []
+                                if plant:
+                                    st.markdown("**Plantillas**")
+                                    st.markdown(bullets(plant))
+                            # Herramientas
+                            with tabs_srv[7]:
+                                hz = d.get("herramientas_requeridas") or []
+                                if hz: st.markdown(bullets(hz))
+                                else: st.info("Sin herramientas requeridas explícitas.")
+                            # Transición
+                            with tabs_srv[8]:
+                                tr = d.get("transicion") or {}
+                                ent = tr.get("entrada") or []
+                                sal = tr.get("salida") or []
+                                if ent: st.markdown("**Transición de entrada**"); st.markdown(bullets(ent))
+                                if sal: st.markdown("**Transición de salida**"); st.markdown(bullets(sal))
+                                if not (ent or sal): st.info("Sin requisitos de transición explícitos.")
+                            # Fuera de alcance / Supuestos
+                            with tabs_srv[9]:
+                                fa = d.get("fuera_alcance") or []
+                                sp = d.get("supuestos") or []
+                                if fa:
+                                    st.markdown("**Fuera de alcance**")
+                                    st.markdown(bullets(fa))
+                                if sp:
+                                    st.markdown("**Supuestos**")
+                                    st.markdown(bullets(sp))
+                                if not (fa or sp):
+                                    st.info("Sin elementos fuera de alcance ni supuestos explícitos.")
                 else:
                     st.info("Sin servicios detallados explícitos en el texto analizado.")
+
                 render_extra_fields("Detalles adicionales (servicios)", svs, {"resumen_servicios","servicios_detalle","alcance","referencias_paginas"})
+
 
             # --------- Importe ---------
             im = fs_sections.get("importe", {})
