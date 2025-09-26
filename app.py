@@ -138,178 +138,239 @@ def login_gate():
 # Prompts “excelentes”: SYSTEM + SECCIONES
 # -----------------------------------------------------------------------------------
 SYSTEM_PREFIX = (
-    "Eres un analista sénior de licitaciones públicas en España y consultor de TI. "
-    "Trabajas EXCLUSIVAMENTE con la información contenida en los PDFs adjuntos. "
-    "Obligatorio: responde SIEMPRE con JSON VÁLIDO (UTF-8) y NADA MÁS. "
-    "Nunca inventes; si falta información, usa null o listas vacías. "
-    "Normaliza unidades y moneda; usa punto decimal (e.g., 12345.67). "
-    "Usa SIEMPRE números JSON puros (sin separadores de miles). "
-    "Incluye referencias de página únicas y orden ascendente. "
-    "Las citas literales no deben superar 180 caracteres. "
-    "Si hay varias cifras/interpretaciones para un mismo dato, indícalo en 'discrepancias' y en 'evidencias' aporta la más relevante. "
-    "Incluye, cuando proceda, un campo opcional 'calidad_extraccion' con {\"texto_total\": int, \"texto_utilizado\": int}. "
-    "Optimiza por: precisión factual > concisión > completitud. "
-    "Evita repetir texto; sintetiza en cada campo y mantén coherencia terminológica. "
+  "Eres analista sénior de licitaciones en España y consultor TI."
+  " Respondes EXCLUSIVAMENTE con JSON VÁLIDO (UTF-8) y NADA MÁS."
+  " Si una clave no aplica o no hay evidencia, devuélvela igualmente con valor null o []."
+  " NUNCA inventes; usa SOLO información de los PDFs."
+  " Normaliza números decimales con punto y moneda explícita (p. ej., EUR)."
+  " Números sin separador de miles. Citas ≤ 180 caracteres."
+  " Incluye referencias de página como enteros únicos en orden ascendente cuando existan."
+  " Si hay versiones alternativas de un dato, usa 'discrepancias' para explicarlo brevemente."
+  " Optimiza por: precisión factual > concisión > completitud."
 )
 
-SECTION_SPECS: Dict[str, Dict[str, str]] = {
-    "objetivos_contexto": {
-        "titulo": "Objetivos y contexto",
-        "user_prompt": (
-            "Analiza los PDFs y extrae OBJETIVOS y CONTEXTO. "
-            "Prioriza 'Objeto del contrato', 'Alcance', 'Descripción del servicio', 'Contexto'. "
-            "Devuelve SOLO JSON con esta estructura (mantén claves, añade opcionales solo si hay datos):\n"
-            "{\n"
-            '  "resumen_servicios": str|null,\n'
-            '  "objetivos": [str],\n'
-            '  "alcance": str|null,\n'
-            '  "referencias_paginas": [int],\n'
-            '  "evidencias": [{"pagina": int, "cita": str}],\n'
-            '  "discrepancias": [str],\n'
-            '  "calidad_extraccion": {"texto_total": int, "texto_utilizado": int}|null\n'
-            "}\n"
-            "Reglas: no especules; si los objetivos/alcance no aparecen, usa null/[]; citas ≤180 chars."
-        ),
-    },
-    "servicios": {
-        "titulo": "Servicios solicitados (detalle)",
-        "user_prompt": (
-            "Identifica y lista los SERVICIOS SOLICITADOS con máximo detalle. "
-            "Busca 'Servicios', 'Actividades', 'Tareas', 'Entregables', 'SLA/KPI', 'Periodicidad', 'Volumen'. "
-            "Devuelve SOLO JSON:\n"
-            "{\n"
-            '  "resumen_servicios": str|null,\n'
-            '  "servicios_detalle": [\n'
-            '    {\n'
-            '      "nombre": str,\n'
-            '      "descripcion": str|null,\n'
-            '      "entregables": [str],\n'
-            '      "requisitos": [str],\n'
-            '      "periodicidad": str|null,\n'
-            '      "volumen": str|null,\n'
-            '      "ubicacion_modalidad": str|null,\n'
-            '      "sla_kpi": [{"nombre": str, "objetivo": str|null, "unidad": str|null, "metodo_medicion": str|null}],\n'
-            '      "criterios_aceptacion": [str]\n'
-            "    }\n"
-            "  ],\n"
-            '  "alcance": str|null,\n'
-            '  "referencias_paginas": [int],\n'
-            '  "evidencias": [{"pagina": int, "cita": str}],\n'
-            '  "discrepancias": [str]\n'
-            "}\n"
-            "Reglas: deduplica servicios equivalentes; sintetiza; si un campo no aparece, deja null/[]; citas ≤180 chars."
-        ),
-    },
-    "importe": {
-        "titulo": "Importe de licitación",
-        "user_prompt": (
-            "Extrae importes: presupuesto base de licitación, anualidades/prórrogas e IVA si se explicita. "
-            "Devuelve SOLO JSON (números decimales con punto):\n"
-            "{\n"
-            '  "importe_total": float|null,\n'
-            '  "moneda": str|null,\n'
-            '  "iva_incluido": bool|null,\n'
-            '  "tipo_iva": float|null,\n'
-            '  "importes_detalle": [\n'
-            '    {"concepto": str|null, "importe": float|null, "moneda": str|null, "observaciones": str|null,\n'
-            '     "periodo": {"tipo": "anualidad"|"prorroga"|null, "anyo": int|null, "duracion_meses": int|null}}\n'
-            '  ],\n'
-            '  "referencias_paginas": [int],\n'
-            '  "evidencias": [{"pagina": int, "cita": str}],\n'
-            '  "discrepancias": [str]\n'
-            "}\n"
-            "Reglas: si hay varias cifras para el mismo concepto, recoge todas en 'importes_detalle' y explica en 'discrepancias'."
-        ),
-    },
-    "criterios_valoracion": {
-        "titulo": "Criterios de valoración",
-        "user_prompt": (
-            "Extrae criterios y subcriterios con pesos y tipo (puntos/porcentaje), umbrales y método de evaluación si existe. "
-            "Devuelve SOLO JSON:\n"
-            "{\n"
-            '  "criterios_valoracion": [\n'
-            '    {\n'
-            '      "nombre": str,\n'
-            '      "peso_max": float|null,\n'
-            '      "tipo": "puntos"|"porcentaje"|null,\n'
-            '      "umbral_minimo": float|null,\n'
-            '      "metodo_evaluacion": str|null,\n'
-            '      "subcriterios": [\n'
-            '        {"nombre": str, "peso_max": float|null, "tipo": "puntos"|"porcentaje"|null, "observaciones": str|null}\n'
-            '      ]\n'
-            '    }\n'
-            '  ],\n'
-            '  "criterios_desempate": [str],\n'
-            '  "referencias_paginas": [int],\n'
-            '  "evidencias": [{"pagina": int, "cita": str}],\n'
-            '  "discrepancias": [str]\n'
-            "}\n"
-            "Reglas: conserva jerarquía; deduplica; si el peso se expresa en texto, extrae el número si es inequívoco."
-        ),
-    },
-    "indice_tecnico": {
-        "titulo": "Índice de la respuesta técnica",
-        "user_prompt": (
-            "1) Extrae el ÍNDICE SOLICITADO literal del pliego (si existe). "
-            "2) Si no existe, propón un ÍNDICE ALINEADO con objetivos, alcance, servicios y criterios; implementable: "
-            "   títulos claros, 1-2 líneas de descripción, subapartados accionables (entregables/evidencias). "
-            "Devuelve SOLO JSON:\n"
-            "{\n"
-            '  "indice_respuesta_tecnica": [\n'
-            '    {"titulo": str, "descripcion": str|null, "subapartados": [str]}\n'
-            '  ],\n'
-            '  "indice_propuesto": [\n'
-            '    {"titulo": str, "descripcion": str|null, "subapartados": [str]}\n'
-            '  ],\n'
-            '  "trazabilidad": [{"propuesto": str, "solicitado_match": str|null}],\n'
-            '  "referencias_paginas": [int],\n'
-            '  "evidencias": [{"pagina": int, "cita": str}],\n'
-            '  "discrepancias": [str]\n'
-            "}\n"
-            "Reglas: si no hay índice literal, 'indice_respuesta_tecnica' puede ir [], pero 'indice_propuesto' NO debe ir vacío."
-        ),
-    },
-    "riesgos_exclusiones": {
-        "titulo": "Riesgos y exclusiones",
-        "user_prompt": (
-            "Identifica RIESGOS (contractuales, técnicos/operativos, plazos, dependencias) y EXCLUSIONES. "
-            "Si el pliego no los enumera, sintetiza riesgos plausibles basados EXCLUSIVAMENTE en lo que el pliego sí define "
-            "(objetivos/alcance/servicios/criterios/condiciones). "
-            "Devuelve SOLO JSON:\n"
-            "{\n"
-            '  "riesgos_y_dudas": str|null,\n'
-            '  "exclusiones": [str],\n'
-            '  "matriz_riesgos": [\n'
-            '    {"riesgo": str, "probabilidad_1_5": int|null, "impacto_1_5": int|null,\n'
-            '     "criticidad_1_25": int|null, "mitigacion": str|null, "responsable": str|null}\n'
-            '  ],\n'
-            '  "referencias_paginas": [int],\n'
-            '  "evidencias": [{"pagina": int, "cita": str}],\n'
-            '  "discrepancias": [str]\n'
-            "}\n"
-            "Reglas: no inventes fuera del pliego; si infieres, debe ser compatible con el contenido del pliego y anota la base."
-        ),
-    },
-    "solvencia": {
-        "titulo": "Criterios de solvencia",
-        "user_prompt": (
-            "Extrae SOLVENCIA (técnica, económica, administrativa/otros) y cómo se acredita (documentos/normas/umbrales). "
-            "Devuelve SOLO JSON:\n"
-            "{\n"
-            '  "solvencia": {\n'
-            '    "tecnica": [str],\n'
-            '    "economica": [str],\n'
-            '    "administrativa": [str],\n'
-            '    "acreditacion": [{"requisito": str, "documento_necesario": str|null, "norma_referencia": str|null, "umbral": str|null}]\n'
-            "  },\n"
-            '  "referencias_paginas": [int],\n'
-            '  "evidencias": [{"pagina": int, "cita": str}],\n'
-            '  "discrepancias": [str]\n'
-            "}\n"
-            "Reglas: devuelve bullets atómicos (una condición por elemento); si no hay datos, []."
-        ),
-    },
+SECTION_SPECS = {
+  "objetivos_contexto": {
+    "titulo": "Objetivos y contexto",
+    "user_prompt": (
+      "Extrae objetivos y contexto del pliego. Devuelve SIEMPRE las claves listadas."
+      "\nSalida JSON EXACTA con claves:\n"
+      "{"
+      '  "resumen_servicios": str|null,'
+      '  "objetivos": [str],'
+      '  "alcance": str|null,'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: no inventes; si no hay dato, usa null/[]."
+      "\nEjemplo (mínimo):\n"
+      '{'
+      '  "resumen_servicios": null,'
+      '  "objetivos": [],'
+      '  "alcance": null,'
+      '  "referencias_paginas": [],'
+      '  "evidencias": [],'
+      '  "discrepancias": []'
+      "}"
+    ),
+  },
+
+  "servicios": {
+    "titulo": "Servicios solicitados (detalle)",
+    "user_prompt": (
+      "Lista servicios solicitados y detalles (entregables, SLAs/KPIs, etc.). Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "resumen_servicios": str|null,'
+      '  "servicios_detalle": ['
+      '    {'
+      '      "nombre": str,'
+      '      "descripcion": str|null,'
+      '      "entregables": [str],'
+      '      "requisitos": [str],'
+      '      "periodicidad": str|null,'
+      '      "volumen": str|null,'
+      '      "ubicacion_modalidad": str|null,'
+      '      "sla_kpi": [{"nombre": str, "objetivo": str|null, "unidad": str|null, "metodo_medicion": str|null}],'
+      '      "criterios_aceptacion": [str]'
+      '    }'
+      '  ],'
+      '  "alcance": str|null,'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: deduplica; no inventes; null/[] si no hay."
+      "\nEjemplo (mínimo):\n"
+      '{'
+      '  "resumen_servicios": null,'
+      '  "servicios_detalle": [],'
+      '  "alcance": null,'
+      '  "referencias_paginas": [],'
+      '  "evidencias": [],'
+      '  "discrepancias": []'
+      "}"
+    ),
+  },
+
+  "importe": {
+    "titulo": "Importe de licitación",
+    "user_prompt": (
+      "Extrae importes y condiciones (IVA, anualidades/prórrogas). Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "importe_total": float|null,'
+      '  "moneda": str|null,'
+      '  "iva_incluido": bool|null,'
+      '  "tipo_iva": float|null,'
+      '  "importes_detalle": ['
+      '    {"concepto": str|null, "importe": float|null, "moneda": str|null, "observaciones": str|null,'
+      '     "periodo": {"tipo": "anualidad"|"prorroga"|null, "anyo": int|null, "duracion_meses": int|null}}'
+      '  ],'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: números con punto; si hay varias cifras, recoge todas en importes_detalle y usa discrepancias."
+      "\nEjemplo (mínimo):\n"
+      '{'
+      '  "importe_total": null,'
+      '  "moneda": null,'
+      '  "iva_incluido": null,'
+      '  "tipo_iva": null,'
+      '  "importes_detalle": [],'
+      '  "referencias_paginas": [],'
+      '  "evidencias": [],'
+      '  "discrepancias": []'
+      "}"
+    ),
+  },
+
+  "criterios_valoracion": {
+    "titulo": "Criterios de valoración",
+    "user_prompt": (
+      "Extrae criterios/subcriterios con pesos, tipo, umbrales, método y desempates. Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "criterios_valoracion": ['
+      '    {'
+      '      "nombre": str,'
+      '      "peso_max": float|null,'
+      '      "tipo": "puntos"|"porcentaje"|null,'
+      '      "umbral_minimo": float|null,'
+      '      "metodo_evaluacion": str|null,'
+      '      "subcriterios": ['
+      '        {"nombre": str, "peso_max": float|null, "tipo": "puntos"|"porcentaje"|null, "observaciones": str|null}'
+      '      ]'
+      '    }'
+      '  ],'
+      '  "criterios_desempate": [str],'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: conserva jerarquía; null/[] si no hay."
+      "\nEjemplo (mínimo):\n"
+      '{'
+      '  "criterios_valoracion": [],'
+      '  "criterios_desempate": [],'
+      '  "referencias_paginas": [],'
+      '  "evidencias": [],'
+      '  "discrepancias": []'
+      "}"
+    ),
+  },
+
+  "indice_tecnico": {
+    "titulo": "Índice de la respuesta técnica",
+    "user_prompt": (
+      "1) Si existe, extrae el índice solicitado literal. 2) Si no, propone un índice alineado (implementable)."
+      " Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "indice_respuesta_tecnica": ['
+      '    {"titulo": str, "descripcion": str|null, "subapartados": [str]}'
+      '  ],'
+      '  "indice_propuesto": ['
+      '    {"titulo": str, "descripcion": str|null, "subapartados": [str]}'
+      '  ],'
+      '  "trazabilidad": [{"propuesto": str, "solicitado_match": str|null}],'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: si no hay índice literal, 'indice_respuesta_tecnica' puede ir [], pero 'indice_propuesto' NO debe ir vacío."
+      "\nEjemplo (mínimo):\n"
+      '{'
+      '  "indice_respuesta_tecnica": [],'
+      '  "indice_propuesto": [{"titulo": "Propuesta de valor", "descripcion": null, "subapartados": []}],'
+      '  "trazabilidad": [],'
+      '  "referencias_paginas": [],'
+      '  "evidencias": [],'
+      '  "discrepancias": []'
+      "}"
+    ),
+  },
+
+  "riesgos_exclusiones": {
+    "titulo": "Riesgos y exclusiones",
+    "user_prompt": (
+      "Identifica riesgos y exclusiones del pliego. Si no hay lista explícita, sintetiza riesgos compatibles con lo definido."
+      " Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "riesgos_y_dudas": str|null,'
+      '  "exclusiones": [str],'
+      '  "matriz_riesgos": ['
+      '    {"riesgo": str, "probabilidad_1_5": int|null, "impacto_1_5": int|null,'
+      '     "criticidad_1_25": int|null, "mitigacion": str|null, "responsable": str|null}'
+      '  ],'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: no inventes fuera del pliego; si infieres, debe ser coherente con lo que SÍ aparece."
+      "\nEjemplo (mínimo):\n"
+      '{'
+      '  "riesgos_y_dudas": null,'
+      '  "exclusiones": [],'
+      '  "matriz_riesgos": [],'
+      '  "referencias_paginas": [],'
+      '  "evidencias": [],'
+      '  "discrepancias": []'
+      "}"
+    ),
+  },
+
+  "solvencia": {
+    "titulo": "Criterios de solvencia",
+    "user_prompt": (
+      "Extrae solvencia técnica, económica y administrativa y cómo se acredita. Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "solvencia": {'
+      '    "tecnica": [str],'
+      '    "economica": [str],'
+      '    "administrativa": [str],'
+      '    "acreditacion": [{"requisito": str, "documento_necesario": str|null, "norma_referencia": str|null, "umbral": str|null}]'
+      '  },'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: una condición por bullet; null/[] si no hay."
+      "\nEjemplo (mínimo):\n"
+      '{'
+      '  "solvencia": {"tecnica": [], "economica": [], "administrativa": [], "acreditacion": []},'
+      '  "referencias_paginas": [],'
+      '  "evidencias": [],'
+      '  "discrepancias": []'
+      "}"
+    ),
+  },
 }
+
 
 # -----------------------------------------------------------------------------------
 # Keywords (recall) + Tuning por sección
