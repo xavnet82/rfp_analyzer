@@ -1,7 +1,7 @@
 # app.py
 # -----------------------------------------------------------------------------------
 # RFP Analyzer – Streamlit (consultoría TI) | "PDF completo" + fallback local
-# - Modelos visibles: gpt-4o y gpt-4o-mini (temperatura fija = 0.2)
+# - Modelos visibles: gpt-4o y gpt-4o-mini
 # - UX de una sola vista de análisis + una pestaña de "Registro (Prompts/Respuestas)"
 # - Sin file_search ni attachments: enviamos los PDFs como input_file a /responses
 # - Fallback local con selección de páginas relevantes y síntesis garantizada
@@ -843,7 +843,7 @@ def sidebar_config() -> Tuple[str, float]:
         else:
             idx = 0
         model = st.selectbox("Modelo OpenAI", AVAILABLE_MODELS, index=idx)
-        st.caption("Temperatura fija: 0.2")
+        st.caption("Temperatura fija: 0.5")
     return model, FIXED_TEMPERATURE
 
 # -----------------------------------------------------------------------------------
@@ -1157,7 +1157,7 @@ def sidebar_and_header():
     login_gate()
     model, temperature = sidebar_config()
     st.title(APP_TITLE)
-    st.caption("Analizador de pliegos con enfoque de consultoría TI (GPT-4o / 4o-mini). Temperatura fija (0.2).")
+    st.caption("Analizador de pliegos con enfoque de consultoría TI (GPT-4o / 4o-mini). Temperatura fija (0.5).")
     return model, temperature
 
 def main():
