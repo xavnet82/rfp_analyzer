@@ -14,8 +14,8 @@ from config import (
     APP_TITLE,
     OPENAI_MODEL,
     OPENAI_API_KEY,
-    OPENAI_TEMPERATURE,
-    MODELS_CATALOG,
+    OPENAI_TEMPERATURE,   # no se usará en UI; temperatura fija 0.2
+    MODELS_CATALOG,       # no se usará; dejamos import por compatibilidad
     ADMIN_USER,
     ADMIN_PASSWORD,
     MAX_TOKENS_PER_REQUEST,
@@ -26,7 +26,16 @@ from services.pdf_loader import extract_pdf_text
 from services.schema import OfertaAnalizada
 from services.openai_client import analyze_text_chunk, merge_offers
 from utils.text import clean_text, chunk_text
-from components.ui import render_header, render_result
+from components.ui import render_header
+
+# ---------------------------------------------------------------------
+# Parámetros de esta versión
+# ---------------------------------------------------------------------
+AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini"]
+FIXED_TEMPERATURE = 0.2
+CHUNK_MAX_CHARS_DEFAULT = 12_000  # usado en fallback map-reduce
+SECOND_TAB_KEY = "full_view_ready"
+
 
 # ---------------------------------------------------------------------
 # Página
@@ -97,11 +106,9 @@ def _json_loads_robust(raw: Any) -> Any:
         return json.loads(brace)
 
 def _coalesce_text_from_responses(rsp) -> Optional[str]:
-    # 1) Propiedad estándar
     txt = getattr(rsp, "output_text", None)
     if txt:
         return txt
-    # 2) Recorrer bloques (output / content / text)
     out = getattr(rsp, "output", None)
     if out:
         parts = []
@@ -118,7 +125,6 @@ def _coalesce_text_from_responses(rsp) -> Optional[str]:
                             parts.append(v)
         if parts:
             return "\n".join(parts)
-    # 3) A veces el SDK expone message único
     msg = getattr(rsp, "message", None)
     if msg and isinstance(getattr(msg, "content", None), list):
         parts = []
@@ -162,38 +168,27 @@ def _responses_create_robust(args: dict):
         except (BadRequestError, TypeError) as e:
             s = str(e)
 
-            # 1) temperature
             if _is_temperature_error(e) or ("unexpected keyword" in s and "temperature" in s):
-                a.pop("temperature", None)
-                continue
+                a.pop("temperature", None); continue
 
-            # 2) response_format
             if _is_unsupported_param(e, "response_format") or ("unexpected keyword" in s and "response_format" in s):
-                a.pop("response_format", None)
-                continue
+                a.pop("response_format", None); continue
 
-            # 3) max_output_tokens -> max_completion_tokens
             if _is_unsupported_param(e, "max_output_tokens") or ("unexpected keyword" in s and "max_output_tokens" in s):
                 val = a.pop("max_output_tokens", None)
-                if val is not None:
-                    a["max_completion_tokens"] = val
+                if val is not None: a["max_completion_tokens"] = val
                 continue
 
-            # 4) attachments: mover a extra_body si el SDK no lo acepta como kw
             if _is_unsupported_param(e, "attachments") or ("unexpected keyword" in s and "attachments" in s):
                 att = a.pop("attachments", None)
-                if att is not None:
-                    extra["attachments"] = att
+                if att is not None: extra["attachments"] = att
                 continue
 
-            # 5) tools: mover a extra_body si el SDK no lo acepta como kw
             if _is_unsupported_param(e, "tools") or ("unexpected keyword" in s and "tools" in s):
                 tools = a.pop("tools", None)
-                if tools is not None:
-                    extra["tools"] = tools
+                if tools is not None: extra["tools"] = tools
                 continue
 
-            # errores de servidor por parámetros desconocidos: propaga para que el caller active fallback
             raise
 
 
@@ -222,7 +217,7 @@ def create_vector_store_from_streamlit_files(files, name: str = "RFP Vector Stor
 
 
 # ---------------------------------------------------------------------
-# Secciones (prompts específicos para File Search)
+# Secciones (prompts para File Search / Map-Reduce)
 # ---------------------------------------------------------------------
 SECTION_SPECS: Dict[str, Dict[str, str]] = {
     "objetivos_contexto": {
@@ -231,7 +226,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
             "Sobre los PDFs aportados, extrae OBJETIVOS y CONTEXTO del pliego. "
             "Devuelve SOLO JSON con campos:\n"
             "{\n"
-            '  "resumen_servicios": str,\n'
+            '  "resumen_servicios": str|null,\n'
             '  "objetivos": [str],\n'
             '  "alcance": str|null,\n'
             '  "referencias_paginas": [int]\n'
@@ -244,7 +239,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
             "Sobre los PDFs, lista los SERVICIOS SOLICITADOS con detalle. "
             "Devuelve SOLO JSON con campos:\n"
             "{\n"
-            '  "resumen_servicios": str,\n'
+            '  "resumen_servicios": str|null,\n'
             '  "servicios_detalle": [{"nombre": str, "descripcion": str|null}],\n'
             '  "alcance": str|null,\n'
             '  "referencias_paginas": [int]\n'
@@ -324,13 +319,8 @@ SYSTEM_PREFIX = (
 
 # ---------------- Conversión a JSON forzada (segunda llamada) ----------------
 def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: str, temperature: Optional[float]):
-    """
-    Si el modelo devolvió texto no JSON, hacemos una 2ª llamada sin herramientas para
-    convertir a JSON válido según el esquema descrito en el prompt de la sección.
-    """
     schema_hint = ""
     if section_key and section_key in SECTION_SPECS:
-        # Reutilizamos el bloque de esquema embebido en el user_prompt
         schema_hint = SECTION_SPECS[section_key]["user_prompt"]
 
     sys_msg = {
@@ -357,10 +347,6 @@ def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: s
     )
     if temperature is not None:
         args["temperature"] = float(temperature)
-    # Modelos gpt-5: suelen rechazar response_format/temperature ≠ 1
-    if args["model"].lower().startswith("gpt-5"):
-        args.pop("temperature", None)
-        args.pop("response_format", None)
 
     rsp = _responses_create_robust(args)
     text = _coalesce_text_from_responses(rsp)
@@ -379,95 +365,85 @@ def _file_search_section_call(
     section_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Lanza una llamada a Responses+FileSearch para una sección concreta y devuelve dict.
-    IMPORTANTE: sin 'tool_resources' (algunos endpoints lo rechazan).
-    Usamos 'attachments' + 'tools' (y _responses_create_robust lo moverá a extra_body si hace falta).
-    Si el texto devuelto no es JSON, se fuerza a JSON con una 2ª llamada sin herramientas.
+    Llama Responses+FileSearch; si el texto no es JSON, fuerza una 2ª llamada de normalización.
     """
     if not file_ids:
         raise RuntimeError("No hay file_ids para adjuntar a la llamada. Reindexa los PDFs.")
 
     model = (model or OPENAI_MODEL).strip()
-    is_gpt5 = model.lower().startswith("gpt-5")
-
     sys_msg = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PREFIX}]}
     usr_msg = {"role": "user",   "content": [{"type": "input_text", "text": user_prompt}]}
 
     args = dict(
         model=model,
         input=[sys_msg, usr_msg],
-        tools=[{"type": "file_search"}],  # habilita la herramienta
+        tools=[{"type": "file_search"}],
         attachments=[{"file_id": fid, "tools": [{"type": "file_search"}]} for fid in file_ids],
         response_format={"type": "json_object"},
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
     )
     if temperature is not None:
         args["temperature"] = float(temperature)
-    if is_gpt5:
-        # Muchos despliegues gpt-5* rechazan temp != 1 y response_format
-        args.pop("temperature", None)
-        args.pop("response_format", None)
 
     rsp = _responses_create_robust(args)
     text = _coalesce_text_from_responses(rsp)
 
-    # Si no hay texto, intentamos rascar JSON del dump crudo
     if not text:
         dump = json.dumps(rsp, default=str)
         try:
             text = _extract_json_block(dump)
             return _json_loads_robust(text)
         except Exception:
-            # Forzamos conversión a JSON con 2ª llamada
             return _force_jsonify_from_text(section_key, dump, model, temperature)
 
-    # Intentamos parsear; si falla, forzamos conversión
     try:
         return _json_loads_robust(text)
     except Exception:
         return _force_jsonify_from_text(section_key, text, model, temperature)
 
+
+# ---------------------------------------------------------------------
+# Fallback local: Map-Reduce por sección
+# ---------------------------------------------------------------------
+def analyze_chunk_safe(current_result, ch_text, model, temperature):
+    try:
+        return analyze_text_chunk(current_result, ch_text, model=model, temperature=temperature)
+    except TypeError:
+        return analyze_text_chunk(current_result, ch_text, model=model)
+
 def _merge_section_payload(section_key: str, acc: Dict[str, Any], part: Dict[str, Any]) -> Dict[str, Any]:
-    """Fusión simple y determinista para cada sección."""
     if section_key == "objetivos_contexto":
         acc["resumen_servicios"] = max([acc.get("resumen_servicios"), part.get("resumen_servicios")], key=lambda x: len(x or ""), default=None)
         acc["alcance"] = max([acc.get("alcance"), part.get("alcance")], key=lambda x: len(x or ""), default=None)
         acc["objetivos"] = list({*(acc.get("objetivos") or []), * (part.get("objetivos") or [])})
-        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
         return acc
-
     if section_key == "servicios":
         acc["resumen_servicios"] = max([acc.get("resumen_servicios"), part.get("resumen_servicios")], key=lambda x: len(x or ""), default=None)
         acc["alcance"] = max([acc.get("alcance"), part.get("alcance")], key=lambda x: len(x or ""), default=None)
         acc["servicios_detalle"] = (acc.get("servicios_detalle") or []) + (part.get("servicios_detalle") or [])
-        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
         return acc
-
     if section_key == "importe":
         acc["importe_total"] = acc.get("importe_total") or part.get("importe_total")
         acc["moneda"] = acc.get("moneda") or part.get("moneda")
         acc["importes_detalle"] = (acc.get("importes_detalle") or []) + (part.get("importes_detalle") or [])
-        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
         return acc
-
     if section_key == "criterios_valoracion":
         acc["criterios_valoracion"] = (acc.get("criterios_valoracion") or []) + (part.get("criterios_valoracion") or [])
-        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
         return acc
-
     if section_key == "indice_tecnico":
         acc["indice_respuesta_tecnica"] = (acc.get("indice_respuesta_tecnica") or []) + (part.get("indice_respuesta_tecnica") or [])
         acc["indice_propuesto"] = (acc.get("indice_propuesto") or []) + (part.get("indice_propuesto") or [])
-        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
         return acc
-
     if section_key == "riesgos_exclusiones":
-        # mantiene texto más largo y concatena exclusiones
         acc["riesgos_y_dudas"] = max([acc.get("riesgos_y_dudas"), part.get("riesgos_y_dudas")], key=lambda x: len(x or ""), default=None)
         acc["exclusiones"] = list({*(acc.get("exclusiones") or []), * (part.get("exclusiones") or [])})
-        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
         return acc
-
     if section_key == "solvencia":
         sv = acc.get("solvencia") or {"tecnica": [], "economica": [], "administrativa": []}
         part_sv = part.get("solvencia") or {"tecnica": [], "economica": [], "administrativa": []}
@@ -475,11 +451,9 @@ def _merge_section_payload(section_key: str, acc: Dict[str, Any], part: Dict[str
         sv["economica"] = list({*sv.get("economica", []), *part_sv.get("economica", [])})
         sv["administrativa"] = list({*sv.get("administrativa", []), *part_sv.get("administrativa", [])})
         acc["solvencia"] = sv
-        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
         return acc
-
     return acc
-
 
 def _empty_payload_for_section(section_key: str) -> Dict[str, Any]:
     if section_key == "objetivos_contexto":
@@ -498,21 +472,14 @@ def _empty_payload_for_section(section_key: str) -> Dict[str, Any]:
         return {"solvencia": {"tecnica": [], "economica": [], "administrativa": []}, "referencias_paginas": []}
     return {}
 
-
 def _local_map_reduce_section(section_key: str, model: str, temperature: float, max_chars: int):
-    """
-    Ejecuta prompts por sección sobre chunks locales y fusiona resultados.
-    """
     docs = st.session_state.get("fs_local_docs", [])
     if not docs:
         raise RuntimeError("No hay texto local para fallback. Reindexa los PDFs.")
-
-    # Construye chunks (unidos entre documentos)
     all_chunks: List[str] = []
     for d in docs:
         all_chunks.extend(chunk_text(d["pages"], max_chars=max_chars))
 
-    # System + esquema a usar (del SECTION_SPECS)
     sys_msg = {"role": "system", "content": [{"type": "input_text", "text": (
         "Eres un analista experto en licitaciones públicas en España. "
         "Devuelve SIEMPRE JSON válido. Si el fragmento no contiene la información, devuelve campos vacíos/null."
@@ -520,7 +487,6 @@ def _local_map_reduce_section(section_key: str, model: str, temperature: float, 
     schema_hint = SECTION_SPECS[section_key]["user_prompt"]
     acc = _empty_payload_for_section(section_key)
 
-    # Itera chunks → llama a Responses → merge
     for ch in all_chunks:
         usr = {"role": "user", "content": [{
             "type": "input_text",
@@ -530,114 +496,25 @@ def _local_map_reduce_section(section_key: str, model: str, temperature: float, 
                 "Responde únicamente con JSON válido UTF-8."
             )
         }]}
-
         args = dict(
             model=(model or OPENAI_MODEL).strip(),
             input=[sys_msg, usr],
             response_format={"type": "json_object"},
             max_output_tokens=MAX_TOKENS_PER_REQUEST,
+            temperature=float(temperature),
         )
-        if temperature is not None:
-            args["temperature"] = float(temperature)
-        if args["model"].lower().startswith("gpt-5"):
-            args.pop("temperature", None)
-            args.pop("response_format", None)
-
         try:
             rsp = _responses_create_robust(args)
             text = _coalesce_text_from_responses(rsp)
             if not text:
-                # intentamos rascar JSON del dump
                 text = _extract_json_block(json.dumps(rsp, default=str))
             part = _json_loads_robust(text)
         except Exception:
-            # chunk sin señal → parte vacía
             part = _empty_payload_for_section(section_key)
-
         acc = _merge_section_payload(section_key, acc, part)
-
     return acc
 
-
-# ---------------------------------------------------------------------
-# Fallback local por secciones (si el endpoint no admite File Search)
-# ---------------------------------------------------------------------
-def analyze_chunk_safe(current_result, ch_text, model, temperature):
-    """Compat con firmas antiguas de analyze_text_chunk."""
-    try:
-        return analyze_text_chunk(current_result, ch_text, model=model, temperature=temperature)
-    except TypeError:
-        return analyze_text_chunk(current_result, ch_text, model=model)
-
-def _fallback_local_section(section_key: str, model: str, temperature: float, max_chars: int):
-    """
-    Fallback robusto: analiza localmente por chunks con analyze_text_chunk (pipeline existente)
-    y devuelve un dict con la forma esperada por la sección.
-    """
-    docs = st.session_state.get("fs_local_docs", [])
-    if not docs:
-        raise RuntimeError("No hay texto local para fallback. Reindexa los PDFs.")
-
-    # Construimos chunks según el slider actual
-    all_chunks: List[str] = []
-    for d in docs:
-        chunks = chunk_text(d["pages"], max_chars=max_chars)
-        all_chunks.extend(chunks)
-
-    # Pasada de análisis global con tu pipeline existente
-    result = None
-    for ch in all_chunks:
-        result = analyze_chunk_safe(result, ch, model=model, temperature=temperature)
-
-    # Map al JSON esperado por cada sección
-    if section_key == "objetivos_contexto":
-        return {
-            "resumen_servicios": result.resumen_servicios,
-            "objetivos": result.objetivos,
-            "alcance": result.alcance,
-            "referencias_paginas": result.referencias_paginas,
-        }
-    elif section_key == "servicios":
-        return {
-            "resumen_servicios": result.resumen_servicios,
-            "servicios_detalle": [],
-            "alcance": result.alcance,
-            "referencias_paginas": result.referencias_paginas,
-        }
-    elif section_key == "importe":
-        return {
-            "importe_total": result.importe_total,
-            "moneda": result.moneda,
-            "importes_detalle": [d.model_dump() for d in result.importes_detalle],
-            "referencias_paginas": result.referencias_paginas,
-        }
-    elif section_key == "criterios_valoracion":
-        return {
-            "criterios_valoracion": [c.model_dump() for c in result.criterios_valoracion],
-            "referencias_paginas": result.referencias_paginas,
-        }
-    elif section_key == "indice_tecnico":
-        return {
-            "indice_respuesta_tecnica": [s.model_dump() for s in result.indice_respuesta_tecnica],
-            "indice_propuesto": [s.model_dump() for s in result.indice_propuesto],
-            "referencias_paginas": result.referencias_paginas,
-        }
-    elif section_key == "riesgos_exclusiones":
-        return {
-            "riesgos_y_dudas": result.riesgos_y_dudas,
-            "exclusiones": [],
-            "referencias_paginas": result.referencias_paginas,
-        }
-    elif section_key == "solvencia":
-        return {
-            "solvencia": {"tecnica": [], "economica": [], "administrativa": []},
-            "referencias_paginas": result.referencias_paginas,
-        }
-    else:
-        return {"mensaje": "Sección no reconocida", "section_key": section_key}
-
 def _run_section_with_fallback(section_key: str, vs_id: str, file_ids: List[str], model: str, temperature: float, max_chars: int):
-    # 1º intento: File Search (si el servidor lo soporta y devuelve algo)
     try:
         data = _file_search_section_call(
             vector_store_id=vs_id,
@@ -647,70 +524,157 @@ def _run_section_with_fallback(section_key: str, vs_id: str, file_ids: List[str]
             file_ids=file_ids,
             section_key=section_key,
         )
-        # ¿vino vacío?
+        # vacío → forzamos fallback
         if not data or all((v in (None, [], {}) for v in data.values())):
             raise RuntimeError("File Search devolvió JSON vacío.")
         return data, "file_search"
-    except Exception as e:
-        msg = str(e)
-        # Cualquier rechazo/ausencia → Map-Reduce local
+    except Exception:
         data = _local_map_reduce_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
         return data, "local_map_reduce"
 
 
-
 # ---------------------------------------------------------------------
-# Sidebar (config)
+# Sidebar (config) – limitado a 4o/4o-mini, temperatura fija
 # ---------------------------------------------------------------------
 def sidebar_config():
-    """Dibuja la configuración en sidebar y devuelve (model, temperature, max_chars, mode)."""
     with st.sidebar:
         st.header("Configuración")
-
-        # Selector de modelo (catálogo + opción personalizada)
-        options = MODELS_CATALOG + ["Otro…"]
-        try:
-            default_index = options.index(OPENAI_MODEL) if OPENAI_MODEL in options else 0
-        except Exception:
-            default_index = 0
-
-        model_choice = st.selectbox(
-            "Modelo OpenAI",
-            options=options,
-            index=default_index,
-            help="Selecciona un modelo del catálogo o usa 'Otro…' para escribir uno manualmente."
-        )
-        if model_choice == "Otro…":
-            model = st.text_input("Modelo personalizado", value=OPENAI_MODEL)
+        # Modelo (solo 4o y 4o-mini)
+        if OPENAI_MODEL in AVAILABLE_MODELS:
+            default_idx = AVAILABLE_MODELS.index(OPENAI_MODEL)
         else:
-            model = model_choice
+            default_idx = 0
+        model = st.selectbox("Modelo OpenAI", options=AVAILABLE_MODELS, index=default_idx)
+        st.caption("Temperatura fija: 0.2")
+    # Devolvemos temperatura fija y sin modo (solo File Search)
+    return model, FIXED_TEMPERATURE
 
-        # Temperatura
-        temperature = st.slider(
-            "Temperatura",
-            min_value=0.0, max_value=2.0,
-            value=float(OPENAI_TEMPERATURE), step=0.1
-        )
 
-        # Modo
-        mode = st.radio(
-            "Modo de análisis",
-            ["Chunking local", "PDF completo (File Search)"],
-            index=0,
-            help="File Search sube los PDF a OpenAI y los reutiliza en varias consultas; si no está disponible, la app hará fallback local."
-        )
+# ---------------------------------------------------------------------
+# Render de “Vista completa”
+# ---------------------------------------------------------------------
+def render_full_view(fs_sections: Dict[str, Any]):
+    st.markdown("### Vista completa del análisis")
+    # Métricas principales
+    c1, c2, c3 = st.columns(3)
+    # Objetivos/Resumen
+    oc = fs_sections.get("objetivos_contexto", {})
+    resumen = oc.get("resumen_servicios") or "—"
+    objetivos = oc.get("objetivos") or []
+    alcance = oc.get("alcance") or "—"
 
-        # Chunking local: tamaño de chunk
-        max_chars = st.slider(
-            "Tamaño aprox. de chunk (caracteres)",
-            6_000, 40_000, 12_000, step=1_000
-        )
-        st.caption(
-            "A mayor chunk, menos llamadas pero más tokens. "
-            "Nota: algunos modelos (p.ej., gpt-5*) ignoran temperaturas ≠ 1.0; el cliente se autoajusta."
-        )
+    # Importe
+    im = fs_sections.get("importe", {})
+    imp_total = im.get("importe_total")
+    moneda = im.get("moneda") or "€"
+    imp_str = f"{imp_total:,.2f} {moneda}" if isinstance(imp_total, (int, float)) else "—"
 
-    return model, temperature, max_chars, mode
+    # Solvencia
+    sv = fs_sections.get("solvencia", {}).get("solvencia", {})
+    solv_tec = len(sv.get("tecnica", []))
+    solv_eco = len(sv.get("economica", []))
+    solv_adm = len(sv.get("administrativa", []))
+
+    c1.metric("Importe total", imp_str)
+    c2.metric("Objetivos detectados", len(objetivos))
+    c3.metric("Requisitos de solvencia (tot.)", solv_tec + solv_eco + solv_adm)
+
+    st.divider()
+
+    # Sección Objetivos/Contexto
+    with st.expander("🎯 Objetivos y contexto", expanded=True):
+        st.markdown(f"**Resumen de servicios**: {resumen}")
+        if objetivos:
+            st.markdown("**Objetivos**:")
+            st.write("\n".join([f"- {o}" for o in objetivos]))
+        st.markdown(f"**Alcance**: {alcance}")
+
+    # Servicios solicitados
+    svs = fs_sections.get("servicios", {})
+    with st.expander("🧩 Servicios solicitados (detalle)", expanded=False):
+        st.markdown(f"**Resumen**: {svs.get('resumen_servicios') or '—'}")
+        detalle = svs.get("servicios_detalle") or []
+        if detalle:
+            # tabla simple
+            import pandas as pd
+            df = pd.DataFrame([{"Servicio": d.get("nombre"), "Descripción": d.get("descripcion")} for d in detalle])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No se encontraron servicios detallados explícitos en el texto analizado.")
+
+    # Importe y desglose
+    with st.expander("💶 Importe de licitación", expanded=False):
+        st.markdown(f"**Importe total**: {imp_str}")
+        det = im.get("importes_detalle") or []
+        if det:
+            import pandas as pd
+            df = pd.DataFrame(det)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sin desglose adicional de importes.")
+
+    # Criterios de valoración
+    cv = fs_sections.get("criterios_valoracion", {}).get("criterios_valoracion", [])
+    with st.expander("📊 Criterios de valoración", expanded=False):
+        if cv:
+            rows = []
+            for c in cv:
+                rows.append({
+                    "Criterio": c.get("nombre"),
+                    "Peso máx": c.get("peso_max"),
+                    "Tipo": c.get("tipo"),
+                    "Subcriterios": "; ".join([sc.get("nombre") for sc in (c.get("subcriterios") or []) if sc.get("nombre")]),
+                })
+            import pandas as pd
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No se encontraron criterios explícitos.")
+
+    # Índice técnico: solicitado y propuesto
+    it = fs_sections.get("indice_tecnico", {})
+    with st.expander("🗂️ Índice de la respuesta técnica", expanded=False):
+        col1, col2 = st.columns(2)
+        req = it.get("indice_respuesta_tecnica") or []
+        prop = it.get("indice_propuesto") or []
+        with col1:
+            st.markdown("**Índice solicitado**")
+            if req:
+                st.write("\n".join([f"- {s.get('titulo')}" for s in req]))
+            else:
+                st.info("Sin índice solicitado detectado.")
+        with col2:
+            st.markdown("**Índice propuesto**")
+            if prop:
+                st.write("\n".join([f"- {s.get('titulo')}" for s in prop]))
+            else:
+                st.info("Sin índice propuesto.")
+
+    # Riesgos / Exclusiones
+    rx = fs_sections.get("riesgos_exclusiones", {})
+    with st.expander("⚠️ Riesgos y exclusiones", expanded=False):
+        ry = rx.get("riesgos_y_dudas")
+        ex = rx.get("exclusiones") or []
+        st.markdown(f"**Riesgos y dudas**: {ry or '—'}")
+        if ex:
+            st.markdown("**Exclusiones**:")
+            st.write("\n".join([f"- {e}" for e in ex]))
+
+    # Solvencia
+    with st.expander("📜 Solvencia", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        tec = sv.get("tecnica", [])
+        eco = sv.get("economica", [])
+        adm = sv.get("administrativa", [])
+        with col1:
+            st.markdown("**Técnica**")
+            st.write("\n".join([f"- {x}" for x in tec]) or "—")
+        with col2:
+            st.markdown("**Económica**")
+            st.write("\n".join([f"- {x}" for x in eco]) or "—")
+        with col3:
+            st.markdown("**Administrativa**")
+            st.write("\n".join([f"- {x}" for x in adm]) or "—")
 
 
 # ---------------------------------------------------------------------
@@ -720,8 +684,8 @@ def main():
     # 1) Login
     login_gate()
 
-    # 2) Config
-    model, temperature, max_chars, mode = sidebar_config()
+    # 2) Config: solo modelo y temperatura fija
+    model, temperature = sidebar_config()
 
     # 3) Cabecera
     render_header(APP_TITLE)
@@ -735,135 +699,76 @@ def main():
         st.info("Sube al menos un PDF para comenzar el análisis.")
         st.stop()
 
-    # =========================================================
-    # A) Modo Chunking local (pipeline existente)
-    # =========================================================
-    if mode == "Chunking local":
-        docs = []
-        total_chunks = 0
-        with st.spinner("Extrayendo texto de los PDFs..."):
-            for file in files:
-                pdf_bytes = file.read()
-                buf = io.BytesIO(pdf_bytes)
-                pages, _full = extract_pdf_text(buf)
-                pages = [clean_text(p) for p in pages]
-                chunks = chunk_text(pages, max_chars=max_chars)
-                docs.append({
-                    "name": file.name,
-                    "pages": pages,
-                    "chunks": chunks,
-                    "num_pages": len(pages)
-                })
-                total_chunks += len(chunks)
+    # 5) Indexación en OpenAI + captura de texto local (para fallback/map-reduce)
+    if "fs_vs_id" not in st.session_state or st.button("Reindexar PDFs en OpenAI"):
+        st.session_state.pop("fs_sections", None)
+        st.session_state.pop(SECOND_TAB_KEY, None)
 
-        st.success(
-            f"Se han leído {len(docs)} fichero(s). "
-            f"Total páginas: {sum(d['num_pages'] for d in docs)}; "
-            f"total chunks: {total_chunks}."
-        )
+        uploaded = [{"name": f.name, "bytes": f.read()} for f in files]
 
-        if st.button("Analizar con OpenAI (chunking local)", type="primary"):
-            aggregate_result = None
-            per_file_results = {}
-            prog = st.progress(0.0)
-            status = st.empty()
-            processed = 0
+        class _MemFile:
+            def __init__(self, name, data): self.name=name; self._data=data
+            def read(self): return self._data
 
-            for d in docs:
-                n_chunks = len(d["chunks"])
-                status.info(f"Analizando: {d['name']} ({n_chunks} chunks)...")
-                result = None
-                for ch_idx, ch in enumerate(d["chunks"], start=1):
-                    try:
-                        result = analyze_chunk_safe(result, ch, model=model, temperature=temperature)
-                    except Exception as e:
-                        st.error(f"Error analizando **{d['name']}**, chunk {ch_idx}/{n_chunks}: {e}")
-                        raise
-                    processed += 1
-                    prog.progress(processed / max(total_chunks, 1))
-                per_file_results[d["name"]] = result
-                aggregate_result = result if aggregate_result is None else merge_offers(aggregate_result, result)
+        mem_files = [_MemFile(u["name"], u["bytes"]) for u in uploaded]
 
-            status.success("Análisis completado.")
-            st.session_state["per_file_results"] = per_file_results
-            st.session_state["aggregate_result"] = aggregate_result
+        with st.spinner("Indexando PDFs en OpenAI (Vector Store)..."):
+            vs_id, file_ids = create_vector_store_from_streamlit_files(mem_files, name="RFP Vector Store")
 
-    # =========================================================
-    # B) Modo PDF completo (File Search) + Fallback local
-    # =========================================================
-    else:
-        # (1) Preparar/crear Vector Store (solo 1 vez por subida) y capturar texto local para fallback
-        if "fs_vs_id" not in st.session_state or st.button("Reindexar PDFs en OpenAI"):
-            st.session_state.pop("fs_sections", None)
+        # Texto local y diagnóstico
+        local_docs = []
+        char_stats = []
+        for u in uploaded:
+            pages, _ = extract_pdf_text(io.BytesIO(u["bytes"]))
+            pages = [clean_text(p) for p in pages]
+            local_docs.append({"name": u["name"], "pages": pages})
+            total_chars = sum(len(p or "") for p in pages)
+            char_stats.append((u["name"], len(pages), total_chars))
 
-            # Leemos los PDFs a memoria UNA vez
-            uploaded = [{"name": f.name, "bytes": f.read()} for f in files]
+        st.session_state["fs_vs_id"] = vs_id
+        st.session_state["fs_file_ids"] = file_ids
+        st.session_state["fs_local_docs"] = local_docs
+        st.session_state["char_stats"] = char_stats
 
-            # Wrapper para usar create_vector_store_from_streamlit_files
-            class _MemFile:
-                def __init__(self, name, data):
-                    self.name = name
-                    self._data = data
-                def read(self):
-                    return self._data
+        st.success("PDF(s) indexados en OpenAI y texto local preparado.")
 
-            mem_files = [_MemFile(u["name"], u["bytes"]) for u in uploaded]
+    vs_id = st.session_state.get("fs_vs_id")
+    file_ids = st.session_state.get("fs_file_ids", [])
+    local_docs = st.session_state.get("fs_local_docs", [])
+    if not vs_id:
+        st.stop()
 
-            with st.spinner("Indexando PDFs en OpenAI (Vector Store)..."):
-                vs_id, file_ids = create_vector_store_from_streamlit_files(mem_files, name="RFP Vector Store")
+    # Diagnóstico de texto extraído
+    st.info("Texto extraído por PDF (diagnóstico):")
+    for name, npages, nchar in st.session_state.get("char_stats", []):
+        st.write(f"- **{name}**: {npages} páginas, {nchar} caracteres")
+        if nchar < 1000:
+            st.warning(f"{name}: muy poco texto extraído (posible PDF escaneado sin OCR).")
 
-            # Guardamos ids y también el TEXTO local (para fallback)
-            local_docs = []
-            for u in uploaded:
-                pages, _ = extract_pdf_text(io.BytesIO(u["bytes"]))
-                pages = [clean_text(p) for p in pages]
-                local_docs.append({
-                    "name": u["name"],
-                    "pages": pages,
-                })
-            char_stats = []
-            for d in local_docs:
-                total_chars = sum(len(p or "") for p in d["pages"])
-                char_stats.append((d["name"], len(d["pages"]), total_chars))
-            
-            st.info("Texto extraído por PDF (diagnóstico):")
-            for name, npages, nchar in char_stats:
-                st.write(f"- **{name}**: {npages} páginas, {nchar} caracteres extraídos")
-                if nchar < 1000:
-                    st.warning(f"{name}: muy poco texto extraído (posible PDF escaneado sin OCR).")
-        
-            st.session_state["fs_vs_id"] = vs_id
-            st.session_state["fs_file_ids"] = file_ids
-            st.session_state["fs_local_docs"] = local_docs
-            st.success("PDF(s) indexados en OpenAI y texto local preparado.")
+    st.info(f"Vector Store listo: `{vs_id}` – {len(file_ids)} archivo(s) adjuntables")
 
-        vs_id = st.session_state.get("fs_vs_id")
-        file_ids = st.session_state.get("fs_file_ids", [])
-        local_docs = st.session_state.get("fs_local_docs", [])
-        if not vs_id:
-            st.stop()
+    # 6) Pestañas de trabajo
+    tab1, tab2 = st.tabs(["Análisis por secciones", "Vista completa"])
 
-        st.info(f"Vector Store listo: `{vs_id}` – {len(file_ids)} archivo(s) adjuntables")
-
-        # (2) Botonera de secciones
+    with tab1:
         st.subheader("Análisis por secciones")
         c1, c2, c3 = st.columns(3)
         with c1:
-            b_obj = st.button("Objetivos y contexto")
-            b_serv = st.button("Servicios solicitados")
-            b_imp = st.button("Importe de licitación")
+            b_obj  = st.button("Objetivos y contexto", use_container_width=True)
+            b_serv = st.button("Servicios solicitados", use_container_width=True)
+            b_imp  = st.button("Importe de licitación", use_container_width=True)
         with c2:
-            b_crit = st.button("Criterios de valoración")
-            b_idx = st.button("Índice de la respuesta técnica")
-            b_risk = st.button("Riesgos y exclusiones")
+            b_crit = st.button("Criterios de valoración", use_container_width=True)
+            b_idx  = st.button("Índice de la respuesta técnica", use_container_width=True)
+            b_risk = st.button("Riesgos y exclusiones", use_container_width=True)
         with c3:
-            b_solv = st.button("Criterios de solvencia")
+            b_solv = st.button("Criterios de solvencia", use_container_width=True)
             st.write("")
+            b_all  = st.button("🔎 Análisis Completo", type="primary", use_container_width=True)
 
         if "fs_sections" not in st.session_state:
             st.session_state["fs_sections"] = {}
 
-        # (3) Ejecutar sección solicitada (con fallback automático)
         def run_section(section_key: str):
             spec = SECTION_SPECS[section_key]
             with st.spinner(f"Analizando sección: {spec['titulo']}..."):
@@ -873,11 +778,11 @@ def main():
                     file_ids=file_ids,
                     model=model,
                     temperature=temperature,
-                    max_chars=max_chars,
+                    max_chars=CHUNK_MAX_CHARS_DEFAULT,
                 )
             st.session_state["fs_sections"][section_key] = data
-            if mode_used == "local_fallback":
-                st.warning(f"Sección '{spec['titulo']}' analizada con **fallback local** (endpoint sin File Search en Responses o sin JSON).")
+            if mode_used == "local_map_reduce":
+                st.warning(f"Sección '{spec['titulo']}' analizada con **fallback local (map-reduce)**.")
             else:
                 st.info(f"Sección '{spec['titulo']}' analizada con **File Search**.")
 
@@ -889,8 +794,17 @@ def main():
         if b_risk: run_section("riesgos_exclusiones")
         if b_solv: run_section("solvencia")
 
-        # (4) Mostrar resultados por sección (si existen)
-        st.subheader("Resultados")
+        if b_all:
+            order = list(SECTION_SPECS.keys())
+            prog = st.progress(0.0)
+            for i, key in enumerate(order, start=1):
+                run_section(key)
+                prog.progress(i/len(order))
+            st.session_state[SECOND_TAB_KEY] = True
+            st.success("Análisis completo finalizado. Abre la pestaña **Vista completa** para ver el resultado consolidado.")
+
+        # Mostrar resultados individuales bajo expanders
+        st.subheader("Resultados por sección")
         for key, spec in SECTION_SPECS.items():
             if key in st.session_state["fs_sections"]:
                 with st.expander(spec["titulo"], expanded=False):
@@ -902,110 +816,12 @@ def main():
                         mime="application/json",
                     )
 
-        # (5) (Opcional) Construir resultado agregado con el esquema principal
-        if st.session_state["fs_sections"]:
-            if st.button("Construir resultado agregado (map a esquema principal)"):
-                payload: Dict[str, Any] = {
-                    "resumen_servicios": "",
-                    "objetivos": [],
-                    "alcance": None,
-                    "importe_total": None,
-                    "moneda": None,
-                    "importes_detalle": [],
-                    "criterios_valoracion": [],
-                    "indice_respuesta_tecnica": [],
-                    "indice_propuesto": [],
-                    "riesgos_y_dudas": None,
-                    "referencias_paginas": [],
-                }
-
-                sec = st.session_state["fs_sections"]
-                # objetivos/contexto
-                oc = sec.get("objetivos_contexto", {})
-                payload["resumen_servicios"] = oc.get("resumen_servicios") or payload["resumen_servicios"]
-                payload["objetivos"] = oc.get("objetivos") or payload["objetivos"]
-                payload["alcance"] = oc.get("alcance") or payload["alcance"]
-                payload["referencias_paginas"] += oc.get("referencias_paginas", [])
-
-                # servicios
-                sv = sec.get("servicios", {})
-                if isinstance(sv.get("resumen_servicios"), str) and len(sv["resumen_servicios"]) > len(payload["resumen_servicios"]):
-                    payload["resumen_servicios"] = sv["resumen_servicios"]
-                payload["alcance"] = payload["alcance"] or sv.get("alcance")
-                payload["referencias_paginas"] += sv.get("referencias_paginas", [])
-
-                # importe
-                im = sec.get("importe", {})
-                payload["importe_total"] = im.get("importe_total") or payload["importe_total"]
-                payload["moneda"] = im.get("moneda") or payload["moneda"]
-                payload["importes_detalle"] += im.get("importes_detalle", [])
-                payload["referencias_paginas"] += im.get("referencias_paginas", [])
-
-                # criterios
-                cv = sec.get("criterios_valoracion", {})
-                payload["criterios_valoracion"] += cv.get("criterios_valoracion", [])
-                payload["referencias_paginas"] += cv.get("referencias_paginas", [])
-
-                # índice
-                ix = sec.get("indice_tecnico", {})
-                payload["indice_respuesta_tecnica"] += ix.get("indice_respuesta_tecnica", [])
-                payload["indice_propuesto"] += ix.get("indice_propuesto", [])
-                payload["referencias_paginas"] += ix.get("referencias_paginas", [])
-
-                # riesgos/exclusiones
-                rx = sec.get("riesgos_exclusiones", {})
-                ry = rx.get("riesgos_y_dudas")
-                ex = rx.get("exclusiones", [])
-                if ry or ex:
-                    txt = (ry or "") + ("\nExclusiones: " + "; ".join(ex) if ex else "")
-                    payload["riesgos_y_dudas"] = (payload["riesgos_y_dudas"] + "\n" + txt).strip() if payload["riesgos_y_dudas"] else txt
-                payload["referencias_paginas"] += rx.get("referencias_paginas", [])
-
-                # ordena y dedup páginas
-                try:
-                    payload["referencias_paginas"] = sorted(set(int(p) for p in payload["referencias_paginas"]))
-                except Exception:
-                    payload["referencias_paginas"] = []
-
-                try:
-                    result = OfertaAnalizada.model_validate(payload)
-                    st.session_state["aggregate_result"] = result
-                    st.success("Resultado agregado construido.")
-                except Exception as e:
-                    st.error(f"No fue posible validar contra el esquema principal: {e}")
-
-    # =========================================================
-    # Visualización común (agregado / por fichero local)
-    # =========================================================
-    per_file_results = st.session_state.get("per_file_results", {})
-    aggregate_result = st.session_state.get("aggregate_result", None)
-
-    if aggregate_result is not None or per_file_results:
-        options = ["Agregado (todos)"] + list(per_file_results.keys())
-        choice = st.selectbox("Vista de resultados (modo chunking local / agregado File Search)", options)
-
-        if choice == "Agregado (todos)":
-            if isinstance(aggregate_result, OfertaAnalizada):
-                render_result(aggregate_result)
+    with tab2:
+        fs_sections = st.session_state.get("fs_sections", {})
+        if not fs_sections:
+            st.info("Aún no hay resultados. Pulsa **Análisis Completo** o ejecuta alguna sección en la pestaña anterior.")
         else:
-            r = per_file_results.get(choice)
-            if isinstance(r, OfertaAnalizada):
-                render_result(r)
-
-        if isinstance(aggregate_result, OfertaAnalizada):
-            with st.expander("Descargas del resultado agregado"):
-                st.download_button(
-                    "Descargar JSON (Agregado)",
-                    aggregate_result.model_dump_json(indent=2),
-                    file_name="analisis_agregado.json",
-                    mime="application/json"
-                )
-                st.download_button(
-                    "Descargar Markdown (Agregado)",
-                    aggregate_result.to_markdown,
-                    file_name="analisis_agregado.md",
-                    mime="text/markdown"
-                )
+            render_full_view(fs_sections)
 
 
 if __name__ == "__main__":
