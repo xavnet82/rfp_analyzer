@@ -546,6 +546,7 @@ def main():
                     user_prompt=spec["user_prompt"],
                     model=model,
                     temperature=temperature,
+                    file_ids=file_ids,  # <-- importante para el fallback 'attachments'
                 )
             st.session_state["fs_sections"][section_key] = data
 
