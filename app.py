@@ -747,74 +747,107 @@ def main():
 
     st.info(f"Vector Store listo: `{vs_id}` – {len(file_ids)} archivo(s) adjuntables")
 
+    # --- Estado de ejecución para evitar duplicados visuales ---
+    st.session_state.setdefault("busy", False)
+    st.session_state.setdefault("job", None)        # sección a ejecutar
+    st.session_state.setdefault("job_all", False)   # ejecutar todas
+    
+    def _start_job(section: str | None = None, do_all: bool = False):
+        st.session_state["job"] = section
+        st.session_state["job_all"] = do_all
+        st.session_state["busy"] = True
+    
     # 6) Pestañas de trabajo
     tab1, tab2 = st.tabs(["Análisis por secciones", "Vista completa"])
 
     with tab1:
         st.subheader("Análisis por secciones")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            b_obj  = st.button("Objetivos y contexto", use_container_width=True)
-            b_serv = st.button("Servicios solicitados", use_container_width=True)
-            b_imp  = st.button("Importe de licitación", use_container_width=True)
-        with c2:
-            b_crit = st.button("Criterios de valoración", use_container_width=True)
-            b_idx  = st.button("Índice de la respuesta técnica", use_container_width=True)
-            b_risk = st.button("Riesgos y exclusiones", use_container_width=True)
-        with c3:
-            b_solv = st.button("Criterios de solvencia", use_container_width=True)
-            st.write("")
-            b_all  = st.button("🔎 Análisis Completo", type="primary", use_container_width=True)
-
-        if "fs_sections" not in st.session_state:
-            st.session_state["fs_sections"] = {}
-
-        def run_section(section_key: str):
-            spec = SECTION_SPECS[section_key]
-            with st.spinner(f"Analizando sección: {spec['titulo']}..."):
-                data, mode_used = _run_section_with_fallback(
-                    section_key=section_key,
-                    vs_id=vs_id,
-                    file_ids=file_ids,
-                    model=model,
-                    temperature=temperature,
-                    max_chars=CHUNK_MAX_CHARS_DEFAULT,
-                )
-            st.session_state["fs_sections"][section_key] = data
-            if mode_used == "local_map_reduce":
-                st.warning(f"Sección '{spec['titulo']}' analizada con **fallback local (map-reduce)**.")
-            else:
-                st.info(f"Sección '{spec['titulo']}' analizada con **File Search**.")
-
-        if b_obj:  run_section("objetivos_contexto")
-        if b_serv: run_section("servicios")
-        if b_imp:  run_section("importe")
-        if b_crit: run_section("criterios_valoracion")
-        if b_idx:  run_section("indice_tecnico")
-        if b_risk: run_section("riesgos_exclusiones")
-        if b_solv: run_section("solvencia")
-
-        if b_all:
-            order = list(SECTION_SPECS.keys())
-            prog = st.progress(0.0)
-            for i, key in enumerate(order, start=1):
-                run_section(key)
-                prog.progress(i/len(order))
-            st.session_state[SECOND_TAB_KEY] = True
-            st.success("Análisis completo finalizado. Abre la pestaña **Vista completa** para ver el resultado consolidado.")
-
-        # Mostrar resultados individuales bajo expanders
+    
+        # Contenedor único para los controles (no se duplican)
+        controls = st.container()
+        with controls:
+            c1, c2, c3 = st.columns(3)
+            dis = st.session_state["busy"]
+    
+            with c1:
+                st.button("Objetivos y contexto",   key="btn_obj",  use_container_width=True,
+                          disabled=dis, on_click=_start_job, kwargs={"section": "objetivos_contexto"})
+                st.button("Servicios solicitados",  key="btn_srv",  use_container_width=True,
+                          disabled=dis, on_click=_start_job, kwargs={"section": "servicios"})
+                st.button("Importe de licitación",  key="btn_imp",  use_container_width=True,
+                          disabled=dis, on_click=_start_job, kwargs={"section": "importe"})
+    
+            with c2:
+                st.button("Criterios de valoración", key="btn_crit", use_container_width=True,
+                          disabled=dis, on_click=_start_job, kwargs={"section": "criterios_valoracion"})
+                st.button("Índice de la respuesta técnica", key="btn_idx", use_container_width=True,
+                          disabled=dis, on_click=_start_job, kwargs={"section": "indice_tecnico"})
+                st.button("Riesgos y exclusiones",   key="btn_risk", use_container_width=True,
+                          disabled=dis, on_click=_start_job, kwargs={"section": "riesgos_exclusiones"})
+    
+            with c3:
+                st.button("Criterios de solvencia",  key="btn_solv", use_container_width=True,
+                          disabled=dis, on_click=_start_job, kwargs={"section": "solvencia"})
+                st.write("")
+                st.button("🔎 Análisis Completo", type="primary", key="btn_all", use_container_width=True,
+                          disabled=dis, on_click=_start_job, kwargs={"do_all": True})
+    
+        # Resultado/estado de ejecución: un único bloque controlado
+        if st.session_state["busy"]:
+            with st.status("Procesando análisis…", expanded=True) as status:
+                try:
+                    if st.session_state["job_all"]:
+                        order = list(SECTION_SPECS.keys())
+                        for k in order:
+                            data, mode_used = _run_section_with_fallback(
+                                section_key=k,
+                                vs_id=st.session_state["fs_vs_id"],
+                                file_ids=st.session_state["fs_file_ids"],
+                                model=model,
+                                temperature=temperature,
+                                max_chars=CHUNK_MAX_CHARS_DEFAULT,
+                            )
+                            st.session_state.setdefault("fs_sections", {})
+                            st.session_state["fs_sections"][k] = data
+                            status.write(f"✓ {SECTION_SPECS[k]['titulo']} ({'File Search' if mode_used=='file_search' else 'Local'})")
+                        st.session_state[SECOND_TAB_KEY] = True
+                        status.update(label="Análisis completo finalizado", state="complete")
+                    else:
+                        k = st.session_state["job"]
+                        spec = SECTION_SPECS[k]
+                        status.update(label=f"Analizando sección: {spec['titulo']}…")
+                        data, mode_used = _run_section_with_fallback(
+                            section_key=k,
+                            vs_id=st.session_state["fs_vs_id"],
+                            file_ids=st.session_state["fs_file_ids"],
+                            model=model,
+                            temperature=temperature,
+                            max_chars=CHUNK_MAX_CHARS_DEFAULT,
+                        )
+                        st.session_state.setdefault("fs_sections", {})
+                        st.session_state["fs_sections"][k] = data
+                        status.update(label=f"Sección '{spec['titulo']}' completada", state="complete")
+                finally:
+                    # Limpieza de estado y re-render limpio
+                    st.session_state["busy"] = False
+                    st.session_state["job"] = None
+                    st.session_state["job_all"] = False
+                    st.rerun()
+    
+        # Visualización de resultados por sección (solo si hay datos y no estamos ocupados)
         st.subheader("Resultados por sección")
-        for key, spec in SECTION_SPECS.items():
-            if key in st.session_state["fs_sections"]:
-                with st.expander(spec["titulo"], expanded=False):
-                    st.json(st.session_state["fs_sections"][key])
-                    st.download_button(
-                        f"Descargar JSON – {spec['titulo']}",
-                        json.dumps(st.session_state["fs_sections"][key], indent=2, ensure_ascii=False),
-                        file_name=f"{key}.json",
-                        mime="application/json",
-                    )
+        if not st.session_state["busy"]:
+            for key, spec in SECTION_SPECS.items():
+                if "fs_sections" in st.session_state and key in st.session_state["fs_sections"]:
+                    with st.expander(spec["titulo"], expanded=False):
+                        st.json(st.session_state["fs_sections"][key])
+                        st.download_button(
+                            f"Descargar JSON – {spec['titulo']}",
+                            json.dumps(st.session_state["fs_sections"][key], indent=2, ensure_ascii=False),
+                            file_name=f"{key}.json",
+                            mime="application/json",
+                        )
+
 
     with tab2:
         fs_sections = st.session_state.get("fs_sections", {})
