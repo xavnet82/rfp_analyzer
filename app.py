@@ -13,7 +13,7 @@ from prompts.specs import SYSTEM_PREFIX, SECTION_SPECS, SECTION_CONTEXT_TUNING, 
 from utils.text import clean_text, bullets
 from ui.render import render_index, resumen_ejecutivo
 
-APP_TITLE = "RFP Analyzer (Consultoría TI)"
+APP_TITLE = "Accenture RFP Analyzer"
 AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini"]
 DEFAULT_TEMPERATURE = 0.2
 LOCAL_CONTEXT_MAX_CHARS = 40000
