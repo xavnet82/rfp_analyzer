@@ -642,44 +642,49 @@ def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: s
     text = _coalesce_text_from_responses(rsp) or _extract_json_block(json.dumps(rsp, default=str))
     return _json_loads_robust(text)
 
-def _file_search_section_call(
-    user_prompt: str,
-    model: str,
-    temperature: Optional[float],
-    file_ids: List[str],
-    section_key: Optional[str] = None,
-) -> Dict[str, Any]:
-    sys_msg = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PREFIX}]}
-    usr_msg = {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]}
-
-    # Pasamos attachments por extra_body para máxima compatibilidad
-    args = dict(
-        model=model,
-        input=[sys_msg, usr_msg],
-        tools=[{"type": "file_search"}],
-        response_format={"type": "json_object"},
-        max_output_tokens=MAX_TOKENS_PER_REQUEST,
-        temperature=temperature,
-        extra_body={
-            "attachments": [{"file_id": fid, "tools": [{"type": "file_search"}]} for fid in file_ids]
-        },
-    )
-
-    rsp = _responses_create_robust(args)
-    text = _coalesce_text_from_responses(rsp)
-
-    if not text:
-        dump = json.dumps(rsp, default=str)
+    def _file_input_section_call(
+        user_prompt: str,
+        model: str,
+        temperature: Optional[float],
+        file_ids: List[str],
+        section_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Envia los PDFs como bloques input_file (sin tools ni attachments).
+        """
+        sys_msg = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PREFIX}]}
+    
+        # Prompt + ficheros
+        content = [{"type": "input_text", "text": user_prompt}]
+        for fid in file_ids:
+            content.append({"type": "input_file", "file_id": fid})
+    
+        usr_msg = {"role": "user", "content": content}
+    
+        args = dict(
+            model=model,
+            input=[sys_msg, usr_msg],
+            response_format={"type": "json_object"},
+            max_output_tokens=MAX_TOKENS_PER_REQUEST,
+            temperature=temperature,
+        )
+    
+        rsp = _responses_create_robust(args)
+        text = _coalesce_text_from_responses(rsp)
+    
+        if not text:
+            dump = json.dumps(rsp, default=str)
+            try:
+                text = _extract_json_block(dump)
+                return _json_loads_robust(text)
+            except Exception:
+                return _force_jsonify_from_text(section_key, dump, model, temperature)
+    
         try:
-            text = _extract_json_block(dump)
             return _json_loads_robust(text)
         except Exception:
-            return _force_jsonify_from_text(section_key, dump, model, temperature)
+            return _force_jsonify_from_text(section_key, text, model, temperature)
 
-    try:
-        return _json_loads_robust(text)
-    except Exception:
-        return _force_jsonify_from_text(section_key, text, model, temperature)
 
 def _local_singlecall_section(section_key: str, model: str, temperature: float, max_chars: int):
     docs = st.session_state.get("fs_local_docs", [])
@@ -790,32 +795,54 @@ def _synthesis_fill_section(section_key: str, model: str, temperature: float):
     return _json_loads_robust(text)
 
 def run_section(section_key: str, model: str, temperature: float, max_chars: int, file_ids: List[str]) -> Tuple[Dict[str, Any], str]:
-    """Ejecuta sección con File Search → fallback local → síntesis garantizada (si aplica)."""
-    # 1) File Search
+    """
+    1º input_file (sin tools): el modelo lee los PDFs directamente.
+    2º fallback local (selección de páginas).
+    3º (solo índice/riesgos) síntesis garantizada.
+    """
+    # 1) input_file
     try:
-        data = _file_search_section_call(
+        data = _file_input_section_call(
             user_prompt=SECTION_SPECS[section_key]["user_prompt"],
             model=model,
             temperature=temperature,
             file_ids=file_ids,
             section_key=section_key,
         )
-        if _is_section_empty(section_key, data):
-            raise RuntimeError("File Search devolvió salida vacía para esta sección.")
+        if _is_effectively_empty(section_key, data):
+            raise RuntimeError("input_file devolvió salida vacía para esta sección.")
         if "referencias_paginas" in data:
             data["referencias_paginas"] = _dedupe_sorted_pages(data.get("referencias_paginas") or [])
-        return data, "file_search"
+        return data, "input_file"
     except Exception:
         # 2) Local
         data = _local_singlecall_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
-        # 3) Síntesis garantizada
-        if section_key in {"indice_tecnico", "riesgos_exclusiones"} and _is_section_empty(section_key, data):
+
+        # 3) Síntesis garantizada para índice/risks si sigue vacío
+        if section_key in {"indice_tecnico", "riesgos_exclusiones"} and _is_effectively_empty(section_key, data):
             synth = _synthesis_fill_section(section_key, model=model, temperature=temperature)
             if isinstance(synth, dict):
                 data = synth
+
         if "referencias_paginas" in data:
             data["referencias_paginas"] = _dedupe_sorted_pages(data.get("referencias_paginas") or [])
         return data, "local_single"
+
+    
+    def _is_effectively_empty(section_key: str, data: Dict[str, Any]) -> bool:
+        if not isinstance(data, dict) or not data:
+            return True
+        keys = REQUIRED_NONEMPTY.get(section_key, [])
+        for k in keys:
+            v = data.get(k)
+            if isinstance(v, str) and v.strip():
+                return False
+            if isinstance(v, (int, float)) and v is not None:
+                return False
+            if isinstance(v, (list, dict)) and len(v) > 0:
+                return False
+        # referencias/evidencias por sí solas no cuentan como “contenido”
+        return True
 
 # -----------------------------------------------------------------------------------
 # Cache de parseo PDF
