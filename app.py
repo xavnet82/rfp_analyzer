@@ -1,3 +1,20 @@
+
+_OCR_ENABLED = True  # set False to disable OCR heuristic programáticamente
+
+# --- Streamlit integration for OCR diagnostics ---
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
+# Ensure pytesseract is configured (Windows) and check engine availability
+try:
+    from ocr_helper import tesseract_available, configure_pytesseract_for_windows
+    configure_pytesseract_for_windows()
+    _HAS_TESSERACT = tesseract_available()
+except Exception:
+    _HAS_TESSERACT = False
+
 # app.py
 # -----------------------------------------------------------------------------------
 # RFP Analyzer – Streamlit (consultoría TI) | "PDF completo" + fallback local
@@ -74,20 +91,57 @@ _oai = OpenAI(api_key=OPENAI_API_KEY)
 # PDF parsing: intenta services.pdf_loader; si no, fallback PyPDF2
 # -----------------------------------------------------------------------------------
 def _fallback_extract_pdf_text(file_like: io.BytesIO) -> Tuple[List[str], str]:
+    '''
+    OCR-capable PDF text extractor.
+    1) Try PyPDF2 extract_text per page.
+    2) If total text is very small, run OCR with pypdfium2 + pytesseract (spa+eng).
+    3) Return (pages, full_text).
+    '''
     try:
-        from PyPDF2 import PdfReader  # type: ignore
-        reader = PdfReader(file_like)
-        pages = []
+        from PyPDF2 import PdfReader
+        import io as _io
+        b = file_like.read()
+        reader = PdfReader(_io.BytesIO(b))
+        pages: List[str] = []
         for page in reader.pages:
             try:
                 t = page.extract_text() or ""
             except Exception:
                 t = ""
             pages.append(t)
-        return pages, "\n".join(pages)
+
+        total_chars = sum(len(x) for x in pages)
+        # Heuristic: if too little text, try OCR
+        if _OCR_ENABLED and total_chars < 1500:
+            try:
+                # OCR path
+                import pdfium  # pypdfium2
+                # Warn in Streamlit if no Tesseract binary is found
+                global _HAS_TESSERACT
+                if (globals().get('st', None) is not None) and not _HAS_TESSERACT:
+                    st.warning('OCR activado pero **no se encontró** el binario de Tesseract en el sistema. Instálalo o desactiva OCR. Se seguirá usando el texto extraído con PyPDF2 cuando exista.')
+                from PIL import Image
+                import pytesseract
+
+                pdf = pdfium.PdfDocument(b)
+                pages_ocr: List[str] = []
+                for i in range(len(pdf)):
+                    page = pdf.get_page(i)
+                    # scale~2.0 ~= 150-200 DPI for most A4 PDFs
+                    pil_image = page.render(scale=2.0).to_pil()
+                    txt = pytesseract.image_to_string(pil_image, lang="spa+eng")
+                    pages_ocr.append(txt or "")
+                # If OCR improved things, adopt it
+                if sum(len(x) for x in pages_ocr) > total_chars:
+                    pages = pages_ocr
+            except Exception:
+                # OCR best-effort; keep PyPDF2 text if OCR fails
+                pass
+
+        return pages, "
+".join(pages)
     except Exception as e:
         raise RuntimeError(f"Fallo al parsear PDF (fallback): {e}")
-
 try:
     from services.pdf_loader import extract_pdf_text as _svc_extract_pdf_text  # type: ignore
     def extract_pdf_text(file_like: io.BytesIO) -> Tuple[List[str], str]:
@@ -747,7 +801,7 @@ def run_section(section_key: str, model: str, temperature: float, max_chars: int
     # 1) input_file
     try:
         data = _file_input_section_call(
-            user_prompt=SECTION_SPECS[section_key]["user_prompt"],
+            user_prompt=_build_prompt_with_hints(section_key),
             model=model,
             temperature=temperature,
             file_ids=file_ids,
