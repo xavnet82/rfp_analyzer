@@ -1,12 +1,12 @@
 # app.py
 # -----------------------------------------------------------------------------------
 # RFP Analyzer – Streamlit (consultoría TI) | "PDF completo" + fallback local
-# - Modelos visibles: gpt-4o y gpt-4o-mini (temperatura fija = 0.2)
+# - Modelos visibles: gpt-4o y gpt-4o-mini (temperatura configurable desde sidebar)
 # - UX de una sola vista de análisis + una pestaña de "Registro (Prompts/Respuestas)"
 # - Sin file_search ni attachments: enviamos los PDFs como input_file a /responses
 # - Fallback local con selección de páginas relevantes y síntesis garantizada
 # - Prompts robustos: JSON obligatorio, evidencias, discrepancias, no alucinar
-# - NUEVO: Sección "Formato y entrega de la oferta"
+# - Sección “Formato y entrega de la oferta”
 # -----------------------------------------------------------------------------------
 
 import os
@@ -27,6 +27,7 @@ OPENAI_API_KEY = None
 ADMIN_USER = "admin"
 ADMIN_PASSWORD = "rfpanalyzer"
 MAX_TOKENS_PER_REQUEST = 1800  # salida de cada sección (JSON), prudente
+DEFAULT_TEMPERATURE = 0.2      # valor por defecto del slider
 
 try:
     from config import (  # type: ignore
@@ -104,7 +105,6 @@ def clean_text(s: str) -> str:
 # Parámetros app
 # -----------------------------------------------------------------------------------
 AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini"]
-FIXED_TEMPERATURE = 0.2
 LOCAL_CONTEXT_MAX_CHARS = 40_000  # por sección (fallback local)
 
 # -----------------------------------------------------------------------------------
@@ -360,7 +360,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       "}"
     ),
   },
-  # -------- NUEVA SECCIÓN: Formato y entrega de la oferta --------
+  # -------- Sección: Formato y entrega de la oferta --------
   "formato_oferta": {
     "titulo": "Formato y entrega de la oferta",
     "user_prompt": (
@@ -464,7 +464,6 @@ SECTION_KEYWORDS = {
       "requisitos de solvencia": 6, "clasificación": 4, "experiencia": 4,
       "medios personales": 4, "medios materiales": 4, "acreditación": 5,
   },
-  # NUEVO: formato_oferta
   "formato_oferta": {
       "formato": 6, "formato de la oferta": 7, "formato de la propuesta": 6,
       "presentación de ofertas": 7, "presentacion de ofertas": 7, "presentación": 5,
@@ -909,7 +908,7 @@ def parse_pdf_cached(name: str, content_bytes: bytes) -> Dict[str, Any]:
     return {"name": name, "pages": pages, "total_chars": total_chars, "hash": _sha256(content_bytes)}
 
 # -----------------------------------------------------------------------------------
-# Sidebar (modelo; temp fija 0.2)
+# Sidebar (modelo + temperatura configurable)
 # -----------------------------------------------------------------------------------
 def sidebar_config() -> Tuple[str, float]:
     with st.sidebar:
@@ -919,8 +918,18 @@ def sidebar_config() -> Tuple[str, float]:
         else:
             idx = 0
         model = st.selectbox("Modelo OpenAI", AVAILABLE_MODELS, index=idx)
-        st.caption("Temperatura fija: 0.2")
-    return model, FIXED_TEMPERATURE
+        temperature = st.slider(
+            "Temperatura",
+            min_value=0.0, max_value=1.0, value=DEFAULT_TEMPERATURE, step=0.05,
+            help=(
+                "Controla la aleatoriedad de la salida.\n\n"
+                "- **Baja (0.0–0.3)**: más determinista/estable (recomendado para pliegos).\n"
+                "- **Media (0.4–0.7)**: equilibrio entre variedad y consistencia.\n"
+                "- **Alta (0.8–1.0)**: más creativa/variada, pero menos estable y con mayor riesgo de ruido."
+            ),
+        )
+        st.caption("Sugerencia: para licitaciones, una temperatura baja (≈0.1–0.3) ofrece resultados más consistentes y pegados al texto.")
+    return model, float(temperature)
 
 # -----------------------------------------------------------------------------------
 # Render de resultados (UX – una sola vista, sin JSON visible)
@@ -1079,7 +1088,7 @@ def render_full_view(fs_sections: Dict[str, Any]):
             st.caption("Discrepancias")
             st.write("\n".join([f"- {d}" for d in disc]))
 
-    # NUEVO: Formato y entrega de la oferta
+    # Formato y entrega de la oferta
     fmt = fs_sections.get("formato_oferta", {})
     with st.expander("🧾 Formato y entrega de la oferta", expanded=False):
         st.markdown(f"**Formato esperado:** {fmt.get('formato_esperado') or '—'}")
@@ -1241,7 +1250,6 @@ def _markdown_full(fs_sections: Dict[str, Any]) -> str:
     else:
         add("- —")
 
-    # NUEVO: Formato y entrega de la oferta
     add("\n## Formato y entrega de la oferta")
     add(f"- **Formato esperado**: {fmt.get('formato_esperado') or '—'}")
     add(f"- **Longitud (pág.)**: {fmt.get('longitud_paginas') if fmt.get('longitud_paginas') is not None else '—'}")
@@ -1322,7 +1330,7 @@ def sidebar_and_header():
     login_gate()
     model, temperature = sidebar_config()
     st.title(APP_TITLE)
-    st.caption("Analizador de pliegos con enfoque de consultoría TI (GPT-4o / 4o-mini). Temperatura fija (0.2).")
+    st.caption(f"Analizador de pliegos (GPT-4o / 4o-mini). Temperatura actual: **{temperature:.2f}**.")
     return model, temperature
 
 def main():
@@ -1425,7 +1433,7 @@ def main():
                                 data, mode = run_section(
                                     section_key=k,
                                     model=model,
-                                    temperature=FIXED_TEMPERATURE,
+                                    temperature=temperature,
                                     max_chars=LOCAL_CONTEXT_MAX_CHARS,
                                     file_ids=st.session_state["fs_file_ids"],
                                 )
@@ -1443,7 +1451,7 @@ def main():
                         data, mode = run_section(
                             section_key=k,
                             model=model,
-                            temperature=FIXED_TEMPERATURE,
+                            temperature=temperature,
                             max_chars=LOCAL_CONTEXT_MAX_CHARS,
                             file_ids=st.session_state["fs_file_ids"],
                         )
