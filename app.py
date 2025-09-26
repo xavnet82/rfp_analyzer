@@ -13,11 +13,11 @@ from prompts.specs import SYSTEM_PREFIX, SECTION_SPECS, SECTION_CONTEXT_TUNING, 
 from utils.text import clean_text, bullets
 from ui.render import render_index, resumen_ejecutivo
 
-APP_TITLE = "RFP Analyzer (Consultoría TI)"
+APP_TITLE = "RFP Analyzer"
 AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini"]
 DEFAULT_TEMPERATURE = 0.2
-LOCAL_CONTEXT_MAX_CHARS = 40000
-MAX_TOKENS_PER_REQUEST = 1800
+LOCAL_CONTEXT_MAX_CHARS = 50000
+MAX_TOKENS_PER_REQUEST = 4000
 
 # Verbosidad → tokens/contexto
 VERBOSITY_TOKENS = {1: 800, 2: 1000, 3: 2000, 4: 3000, 5: 4000}
