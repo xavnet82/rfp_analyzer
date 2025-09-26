@@ -313,7 +313,23 @@ SYSTEM_PREFIX = (
     "Si algo no aparece en los PDFs, devuelve null o listas vacías."
 )
 
-def _file_search_section_call(vector_store_id: str, user_prompt: str, model: str, temperature: Optional[float] = None, file_ids: Optional[list[str]] = None):
+def _file_search_section_call(
+    vector_store_id: str,                 # se mantiene por compat, pero no lo usaremos aquí
+    user_prompt: str,
+    model: str,
+    temperature: Optional[float] = None,
+    file_ids: Optional[list[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Lanza una llamada a Responses+FileSearch para una sección concreta y devuelve dict.
+    IMPORTANTE: sin 'tool_resources' (algunos endpoints lo rechazan).
+    Usamos 'attachments' + 'tools' (y _responses_create_robust lo moverá a extra_body si hace falta).
+    """
+    if not file_ids:
+        raise RuntimeError(
+            "No hay file_ids para adjuntar a la llamada. Reindexa los PDFs para obtenerlos."
+        )
+
     model = (model or OPENAI_MODEL).strip()
     is_gpt5 = model.lower().startswith("gpt-5")
 
@@ -323,16 +339,16 @@ def _file_search_section_call(vector_store_id: str, user_prompt: str, model: str
     args = dict(
         model=model,
         input=[sys_msg, usr_msg],
-        tools=[{"type": "file_search"}],
-        tool_resources={"file_search": {"vector_store_ids": [vector_store_id]}},
+        tools=[{"type": "file_search"}],  # habilita la herramienta de búsqueda
+        # Adjuntamos los PDFs con permiso explícito para file_search
+        attachments=[{"file_id": fid, "tools": [{"type": "file_search"}]} for fid in file_ids],
         response_format={"type": "json_object"},
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
     )
-    if file_ids:
-        args["attachments"] = [{"file_id": fid, "tools": [{"type": "file_search"}]} for fid in file_ids]
     if temperature is not None:
         args["temperature"] = float(temperature)
     if is_gpt5:
+        # Muchos gpt-5* rechazan temp != 1 y response_format
         args.pop("temperature", None)
         args.pop("response_format", None)
 
@@ -342,6 +358,7 @@ def _file_search_section_call(vector_store_id: str, user_prompt: str, model: str
         dump = json.dumps(rsp, default=str)
         text = _extract_json_block(dump)
     return _json_loads_robust(text)
+
 
 
 
