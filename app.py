@@ -277,7 +277,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
   "indice_tecnico": {
     "titulo": "Índice de la respuesta técnica",
     "user_prompt": (
-      "1) Analiza en detalle la propuesta e identifica, si existe, el índice solicitado literal para la respuesta técnica. 2) Si no existiera, propon en base al pliego un índice alineado (implementable)."
+      "1) Analiza en detalle la licitación e identifica, si existe, el detalle del índice solicitado para la respuesta técnica, incluyendo secciones y contenido. 2) Si no existiera, propon en base al pliego un índice alineado (implementable), ordenado, empezando por contexto, metodología de trabajo, alcance, planificación, equipo etc."
       " Devuelve SIEMPRE las claves."
       "\nSalida JSON EXACTA:\n"
       "{"
