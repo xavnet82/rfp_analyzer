@@ -15,7 +15,7 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-DEFAULT_TEMPERATURE = 1.0  # se ignora si el modelo no lo soporta
+DEFAULT_TEMPERATURE = 0.5  # se ignora si el modelo no lo soporta
 
 def _coalesce_text_from_responses(rsp) -> Optional[str]:
     txt = getattr(rsp, "output_text", None)
