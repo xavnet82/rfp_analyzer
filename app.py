@@ -130,36 +130,73 @@ def _responses_create_robust(args: dict):
     Llama a Responses API y se auto-adapta a variaciones del SDK/endpoint:
     - quita temperature si el modelo lo rechaza,
     - quita response_format si el SDK no lo soporta,
-    - cambia max_output_tokens -> max_completion_tokens si es necesario.
+    - cambia max_output_tokens -> max_completion_tokens,
+    - mueve tool_resources/attachments/tools a extra_body si el SDK no acepta esos kwargs.
     """
+    # separamos posibles extra_body preexistentes
     a = dict(args)
-    for _ in range(5):
+    extra = a.pop("extra_body", {}) or {}
+
+    for _ in range(6):
         try:
-            return _oai_client.responses.create(**a)
+            if extra:
+                return _oai_client.responses.create(**a, extra_body=extra)
+            else:
+                return _oai_client.responses.create(**a)
         except (BadRequestError, TypeError) as e:
             s = str(e)
+
+            # 1) temperature no soportado
             if _is_temperature_error(e) or ("unexpected keyword" in s and "temperature" in s):
-                a.pop("temperature", None); continue
+                a.pop("temperature", None)
+                continue
+
+            # 2) response_format no soportado
             if _is_unsupported_param(e, "response_format") or ("unexpected keyword" in s and "response_format" in s):
-                a.pop("response_format", None); continue
+                a.pop("response_format", None)
+                continue
+
+            # 3) max_output_tokens -> max_completion_tokens
             if _is_unsupported_param(e, "max_output_tokens") or ("unexpected keyword" in s and "max_output_tokens" in s):
                 val = a.pop("max_output_tokens", None)
                 if val is not None:
                     a["max_completion_tokens"] = val
                 continue
+
+            # 4) tool_resources como kw no soportado -> mover a extra_body
+            if _is_unsupported_param(e, "tool_resources") or ("unexpected keyword" in s and "tool_resources" in s):
+                tr = a.pop("tool_resources", None)
+                if tr is not None:
+                    extra["tool_resources"] = tr
+                continue
+
+            # 5) attachments como kw no soportado -> mover a extra_body
+            if _is_unsupported_param(e, "attachments") or ("unexpected keyword" in s and "attachments" in s):
+                att = a.pop("attachments", None)
+                if att is not None:
+                    extra["attachments"] = att
+                continue
+
+            # 6) tools como kw no soportado -> mover a extra_body
+            if _is_unsupported_param(e, "tools") or ("unexpected keyword" in s and "tools" in s):
+                tools = a.pop("tools", None)
+                if tools is not None:
+                    extra["tools"] = tools
+                continue
+
+            # Otro error real -> propaga
             raise
+
 
 def create_vector_store_from_streamlit_files(files, name: str = "RFP Vector Store"):
     """
     Sube los PDFs a OpenAI, los indexa en un Vector Store y
-    devuelve (vector_store_id, file_ids) para usar 'attachments' si tu SDK
-    no soporta tool_resources.
+    devuelve (vector_store_id, file_ids) para fallback con 'attachments'.
     """
     store = _oai_client.vector_stores.create(
         name=name,
-        expires_after={"anchor": "last_active_at", "days": 2},  # opcional
+        expires_after={"anchor": "last_active_at", "days": 2},
     )
-
     file_ids = []
     for f in files:
         data = f.read()
@@ -172,8 +209,8 @@ def create_vector_store_from_streamlit_files(files, name: str = "RFP Vector Stor
             vector_store_id=store.id,
             file_id=up.id
         )
-
     return store.id, file_ids
+
 
 # ---- Secciones: prompts específicos ----
 SECTION_SPECS: Dict[str, Dict[str, str]] = {
@@ -276,27 +313,13 @@ SYSTEM_PREFIX = (
     "Si algo no aparece en los PDFs, devuelve null o listas vacías."
 )
 
-def _file_search_section_call(
-    vector_store_id: str,
-    user_prompt: str,
-    model: str,
-    temperature: Optional[float] = None,
-    file_ids: Optional[list[str]] = None,
-) -> Dict[str, Any]:
-    """
-    Lanza una llamada a Responses+FileSearch para una sección concreta y devuelve dict.
-    1º intento: tool_resources (vector store).
-    Fallback si el SDK no lo soporta: attachments con file_ids.
-    """
-
+def _file_search_section_call(vector_store_id: str, user_prompt: str, model: str, temperature: Optional[float] = None, file_ids: Optional[list[str]] = None):
     model = (model or OPENAI_MODEL).strip()
     is_gpt5 = model.lower().startswith("gpt-5")
 
-    # Input en formato "content parts" (más compatible entre SDKs)
     sys_msg = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PREFIX}]}
     usr_msg = {"role": "user",   "content": [{"type": "input_text", "text": user_prompt}]}
 
-    # ---------- Intento A: tool_resources (vector store) ----------
     args = dict(
         model=model,
         input=[sys_msg, usr_msg],
@@ -305,47 +328,15 @@ def _file_search_section_call(
         response_format={"type": "json_object"},
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
     )
+    if file_ids:
+        args["attachments"] = [{"file_id": fid, "tools": [{"type": "file_search"}]} for fid in file_ids]
     if temperature is not None:
         args["temperature"] = float(temperature)
     if is_gpt5:
         args.pop("temperature", None)
         args.pop("response_format", None)
 
-    try:
-        rsp = _responses_create_robust(args)
-        text = _coalesce_text_from_responses(rsp)
-        if not text:
-            dump = json.dumps(rsp, default=str)
-            text = _extract_json_block(dump)
-        return _json_loads_robust(text)
-    except (BadRequestError, TypeError) as e:
-        # Si el SDK no soporta tool_resources, caemos al plan B (attachments)
-        if "tool_resources" not in str(e):
-            # otro error real -> propaga
-            raise
-
-    # ---------- Intento B: attachments (sin vector store) ----------
-    if not file_ids:
-        raise RuntimeError(
-            "El SDK no soporta 'tool_resources' y no hay 'file_ids' para usar 'attachments'. "
-            "Vuelve a indexar guardando file_ids."
-        )
-
-    args_b = dict(
-        model=model,
-        input=[sys_msg, usr_msg],
-        tools=[{"type": "file_search"}],
-        attachments=[{"file_id": fid, "tools": [{"type": "file_search"}]} for fid in file_ids],
-        response_format={"type": "json_object"},
-        max_output_tokens=MAX_TOKENS_PER_REQUEST,
-    )
-    if temperature is not None:
-        args_b["temperature"] = float(temperature)
-    if is_gpt5:
-        args_b.pop("temperature", None)
-        args_b.pop("response_format", None)
-
-    rsp = _responses_create_robust(args_b)
+    rsp = _responses_create_robust(args)
     text = _coalesce_text_from_responses(rsp)
     if not text:
         dump = json.dumps(rsp, default=str)
@@ -505,11 +496,10 @@ def main():
                 st.session_state.pop("fs_sections", None)  # limpia resultados anteriores
             except KeyError:
                 pass
-            with st.spinner("Indexando PDFs en OpenAI (Vector Store)..."):
-                vs_id, file_ids = create_vector_store_from_streamlit_files(files, name="RFP Vector Store")
-            st.session_state["fs_vs_id"] = vs_id
-            st.session_state["fs_file_ids"] = file_ids
-            st.success("PDF(s) indexados en OpenAI.")
+                with st.spinner("Indexando PDFs en OpenAI (Vector Store)..."):
+                    vs_id, file_ids = create_vector_store_from_streamlit_files(files, name="RFP Vector Store")
+                st.session_state["fs_vs_id"] = vs_id
+                st.session_state["fs_file_ids"] = file_ids
         
         vs_id = st.session_state.get("fs_vs_id")
         file_ids = st.session_state.get("fs_file_ids", [])
@@ -546,7 +536,7 @@ def main():
                     user_prompt=spec["user_prompt"],
                     model=model,
                     temperature=temperature,
-                    file_ids=file_ids,  # <-- importante para el fallback 'attachments'
+                    file_ids=file_ids,   # <--- importante
                 )
             st.session_state["fs_sections"][section_key] = data
 
