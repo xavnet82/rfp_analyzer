@@ -1,10 +1,11 @@
 # app.py
 # ---------------------------------------------------------------------
-# RFP Analyzer – Streamlit
+# RFP Analyzer – Streamlit (vista única mejorada)
 #  - Modelos visibles: gpt-4o y gpt-4o-mini
 #  - Temperatura fija = 0.2 (no editable)
-#  - Modo principal: PDF completo con File Search; si no hay soporte o no hay señal → fallback local rápido (una llamada por sección)
-#  - Botones event-driven (sin duplicados visuales); "Análisis Completo" ejecuta secciones en paralelo y compone una vista completa (segunda pestaña)
+#  - Solo 1 página (sin pestañas): controles arriba + “Vista completa” como referencia (sin JSON)
+#  - “Análisis Completo” ejecuta TODAS las secciones SECUENCIALMENTE (una a una)
+#  - PDF completo con File Search; si falla/queda vacío → fallback local rápido (1 llamada/ sección)
 #  - Cacheo de parseo PDF y selección de páginas relevantes por sección (keyword scoring) para acelerar
 # ---------------------------------------------------------------------
 
@@ -15,7 +16,6 @@ import json
 import re
 import hashlib
 from typing import Optional, Dict, Any, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 from openai import OpenAI, BadRequestError
@@ -55,13 +55,15 @@ except Exception as e:
     st.error(f"No se pudo importar utils.text.clean_text: {e}")
     st.stop()
 
+
 # ---------------------------------------------------------------------
 # Parámetros de esta versión
 # ---------------------------------------------------------------------
 AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini"]
 FIXED_TEMPERATURE = 0.2
-LOCAL_CONTEXT_MAX_CHARS = 40_000       # por documento para la selección de páginas
-SECOND_TAB_KEY = "full_view_ready"
+LOCAL_CONTEXT_MAX_CHARS = 40_000       # por doc en selección de páginas relevantes
+SECOND_TAB_KEY = "full_view_ready"     # compat (no hay pestañas, lo mantenemos por si se usa fuera)
+
 
 # ---------------------------------------------------------------------
 # Página / Tema
@@ -73,7 +75,7 @@ st.set_page_config(page_title="RFP Analyzer", layout="wide")
 # Login
 # ---------------------------------------------------------------------
 def login_gate():
-    """Bloquea la UI hasta hacer login; mantiene botón de logout en la sidebar."""
+    """Bloquea la UI hasta hacer login; botón de logout en la sidebar."""
     if st.session_state.get("is_auth", False):
         with st.sidebar:
             if st.button("Cerrar sesión"):
@@ -416,7 +418,6 @@ def _select_relevant_spans(pages: List[str], section_key: str,
     for sc, i in scored:
         if sc <= 0:
             break
-        # añadimos ventana alrededor de la página candidata
         for j in range(max(0, i - window), min(len(pages), i + window + 1)):
             if j in used:
                 continue
@@ -431,7 +432,6 @@ def _select_relevant_spans(pages: List[str], section_key: str,
         if total >= max_chars:
             break
 
-    # Si no hubo hits, coge primeras páginas como contexto de “arranque”
     if not selected:
         for j, txt in enumerate(pages[:3]):
             if not txt:
@@ -630,7 +630,7 @@ def sidebar_config():
 
 
 # ---------------------------------------------------------------------
-# Render de “Vista completa”
+# Render de “Vista completa” (sin JSON)
 # ---------------------------------------------------------------------
 def render_full_view(fs_sections: Dict[str, Any]):
     st.markdown("### Vista completa del análisis")
@@ -750,14 +750,78 @@ def render_full_view(fs_sections: Dict[str, Any]):
             st.write("\n".join([f"- {x}" for x in adm]) or "—")
 
 
+def _markdown_full(fs_sections: Dict[str, Any]) -> str:
+    """Genera un Markdown consolidado para descarga."""
+    parts = ["# Análisis de Pliego – Resultado Completo\n"]
+    oc = fs_sections.get("objetivos_contexto", {})
+    svs = fs_sections.get("servicios", {})
+    im = fs_sections.get("importe", {})
+    cv = fs_sections.get("criterios_valoracion", {}).get("criterios_valoracion", [])
+    it = fs_sections.get("indice_tecnico", {})
+    rx = fs_sections.get("riesgos_exclusiones", {})
+    sv = fs_sections.get("solvencia", {}).get("solvencia", {})
+
+    parts.append("## Objetivos y contexto\n")
+    parts.append(f"- **Resumen**: {oc.get('resumen_servicios') or '—'}")
+    if oc.get("objetivos"):
+        parts.append("**Objetivos**:\n" + "\n".join([f"- {o}" for o in oc["objetivos"]]))
+    parts.append(f"- **Alcance**: {oc.get('alcance') or '—'}\n")
+
+    parts.append("## Servicios solicitados\n")
+    parts.append(f"- **Resumen**: {svs.get('resumen_servicios') or '—'}")
+    det = svs.get("servicios_detalle") or []
+    if det:
+        parts.append("**Detalle:**\n" + "\n".join([f"- {d.get('nombre')}: {d.get('descripcion') or ''}" for d in det]))
+
+    parts.append("\n## Importe de licitación\n")
+    imp_total = im.get("importe_total")
+    moneda = im.get("moneda") or "€"
+    parts.append(f"- **Importe total**: {f'{imp_total:,.2f} {moneda}' if isinstance(imp_total,(int,float)) else '—'}")
+    deti = im.get("importes_detalle") or []
+    if deti:
+        parts.append("**Desglose:**\n" + "\n".join([
+            f"- {d.get('concepto') or '—'}: {d.get('importe')} {d.get('moneda') or moneda} ({d.get('observaciones') or ''})"
+            for d in deti
+        ]))
+
+    parts.append("\n## Criterios de valoración\n")
+    if cv:
+        for c in cv:
+            parts.append(f"- {c.get('nombre')} (peso: {c.get('peso_max')}, tipo: {c.get('tipo')})")
+            sc = c.get("subcriterios") or []
+            for s in sc:
+                parts.append(f"  - {s.get('nombre')} (peso: {s.get('peso_max')}, tipo: {s.get('tipo')})")
+    else:
+        parts.append("- —")
+
+    parts.append("\n## Índice de la respuesta técnica\n")
+    req = it.get("indice_respuesta_tecnica") or []
+    prop = it.get("indice_propuesto") or []
+    parts.append("**Solicitado**:\n" + ("\n".join([f"- {s.get('titulo')}" for s in req if s.get("titulo")]) or "- —"))
+    parts.append("\n**Propuesto**:\n" + ("\n".join([f"- {s.get('titulo')}" for s in prop if s.get("titulo")]) or "- —"))
+
+    parts.append("\n## Riesgos y exclusiones\n")
+    parts.append(f"- **Riesgos y dudas**: {rx.get('riesgos_y_dudas') or '—'}")
+    ex = rx.get("exclusiones") or []
+    if ex:
+        parts.append("**Exclusiones**:\n" + "\n".join([f"- {e}" for e in ex]))
+
+    parts.append("\n## Solvencia\n")
+    parts.append("**Técnica**:\n" + ("\n".join([f"- {x}" for x in sv.get("tecnica", [])]) or "- —"))
+    parts.append("\n**Económica**:\n" + ("\n".join([f"- {x}" for x in sv.get("economica", [])]) or "- —"))
+    parts.append("\n**Administrativa**:\n" + ("\n".join([f"- {x}" for x in sv.get("administrativa", [])]) or "- —"))
+
+    return "\n".join(parts)
+
+
 # ---------------------------------------------------------------------
-# App principal
+# App principal (UNA SOLA VISTA)
 # ---------------------------------------------------------------------
 def main():
     # 1) Login
     login_gate()
 
-    # 2) Config: solo modelo y temperatura fija
+    # 2) Config (sidebar)
     model, temperature = sidebar_config()
 
     # 3) Cabecera
@@ -812,12 +876,13 @@ def main():
         st.stop()
 
     # Diagnóstico de texto extraído
-    st.info(f"Vector Store listo: `{vs_id}` – {len(file_ids)} archivo(s) adjuntables")
-    st.info("Texto extraído por PDF (diagnóstico):")
-    for name, npages, nchar in st.session_state.get("char_stats", []):
-        st.write(f"- **{name}**: {npages} páginas, {nchar} caracteres")
-        if nchar < 1000:
-            st.warning(f"{name}: muy poco texto extraído (posible PDF escaneado sin OCR).")
+    diag_box = st.expander("Diagnóstico de extracción de texto", expanded=False)
+    with diag_box:
+        st.info(f"Vector Store listo: `{vs_id}` – {len(file_ids)} archivo(s) adjuntables")
+        for name, npages, nchar in st.session_state.get("char_stats", []):
+            st.write(f"- **{name}**: {npages} páginas, {nchar} caracteres")
+            if nchar < 1000:
+                st.warning(f"{name}: muy poco texto extraído (posible PDF escaneado sin OCR).")
 
     # 6) Estado de ejecución (para evitar duplicados visuales)
     st.session_state.setdefault("busy", False)
@@ -829,73 +894,41 @@ def main():
         st.session_state["job_all"] = do_all
         st.session_state["busy"] = True
 
-    # 7) Pestañas de trabajo
-    tab1, tab2 = st.tabs(["Análisis por secciones", "Vista completa"])
+    # 7) Controles (arriba) + Vista completa debajo
+    st.subheader("Controles de análisis")
 
-    with tab1:
-        st.subheader("Análisis por secciones")
+    c1, c2, c3 = st.columns(3)
+    dis = st.session_state["busy"]
+    with c1:
+        st.button("Objetivos y contexto",   key="btn_obj",  use_container_width=True,
+                  disabled=dis, on_click=_start_job, kwargs={"section": "objetivos_contexto"})
+        st.button("Servicios solicitados",  key="btn_srv",  use_container_width=True,
+                  disabled=dis, on_click=_start_job, kwargs={"section": "servicios"})
+        st.button("Importe de licitación",  key="btn_imp",  use_container_width=True,
+                  disabled=dis, on_click=_start_job, kwargs={"section": "importe"})
+    with c2:
+        st.button("Criterios de valoración", key="btn_crit", use_container_width=True,
+                  disabled=dis, on_click=_start_job, kwargs={"section": "criterios_valoracion"})
+        st.button("Índice de la respuesta técnica", key="btn_idx", use_container_width=True,
+                  disabled=dis, on_click=_start_job, kwargs={"section": "indice_tecnico"})
+        st.button("Riesgos y exclusiones",   key="btn_risk", use_container_width=True,
+                  disabled=dis, on_click=_start_job, kwargs={"section": "riesgos_exclusiones"})
+    with c3:
+        st.button("Criterios de solvencia",  key="btn_solv", use_container_width=True,
+                  disabled=dis, on_click=_start_job, kwargs={"section": "solvencia"})
+        st.write("")
+        st.button("🔎 Análisis Completo", type="primary", key="btn_all", use_container_width=True,
+                  disabled=dis, on_click=_start_job, kwargs={"do_all": True})
 
-        controls = st.container()
-        with controls:
-            c1, c2, c3 = st.columns(3)
-            dis = st.session_state["busy"]
-
-            with c1:
-                st.button("Objetivos y contexto",   key="btn_obj",  use_container_width=True,
-                          disabled=dis, on_click=_start_job, kwargs={"section": "objetivos_contexto"})
-                st.button("Servicios solicitados",  key="btn_srv",  use_container_width=True,
-                          disabled=dis, on_click=_start_job, kwargs={"section": "servicios"})
-                st.button("Importe de licitación",  key="btn_imp",  use_container_width=True,
-                          disabled=dis, on_click=_start_job, kwargs={"section": "importe"})
-
-            with c2:
-                st.button("Criterios de valoración", key="btn_crit", use_container_width=True,
-                          disabled=dis, on_click=_start_job, kwargs={"section": "criterios_valoracion"})
-                st.button("Índice de la respuesta técnica", key="btn_idx", use_container_width=True,
-                          disabled=dis, on_click=_start_job, kwargs={"section": "indice_tecnico"})
-                st.button("Riesgos y exclusiones",   key="btn_risk", use_container_width=True,
-                          disabled=dis, on_click=_start_job, kwargs={"section": "riesgos_exclusiones"})
-
-            with c3:
-                st.button("Criterios de solvencia",  key="btn_solv", use_container_width=True,
-                          disabled=dis, on_click=_start_job, kwargs={"section": "solvencia"})
-                st.write("")
-                st.button("🔎 Análisis Completo", type="primary", key="btn_all", use_container_width=True,
-                          disabled=dis, on_click=_start_job, kwargs={"do_all": True})
-
-        # Ejecución controlada (sin duplicar UI)
-        if st.session_state["busy"]:
-            with st.status("Procesando análisis…", expanded=True) as status:
-                try:
-                    if st.session_state["job_all"]:
-                        order = list(SECTION_SPECS.keys())
-                        results = {}
-                        max_workers = min(4, len(order))
-                        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                            futs = {
-                                ex.submit(
-                                    _run_section_with_fallback,
-                                    k,
-                                    st.session_state["fs_vs_id"],
-                                    st.session_state["fs_file_ids"],
-                                    model,
-                                    FIXED_TEMPERATURE,
-                                    LOCAL_CONTEXT_MAX_CHARS,
-                                ): k for k in order
-                            }
-                            done = 0
-                            for fut in as_completed(futs):
-                                k = futs[fut]
-                                data, mode_used = fut.result()
-                                st.session_state.setdefault("fs_sections", {})
-                                st.session_state["fs_sections"][k] = data
-                                done += 1
-                                status.write(f"✓ {SECTION_SPECS[k]['titulo']} ({'File Search' if mode_used=='file_search' else 'Local'}) [{done}/{len(order)}]")
-
-                        st.session_state[SECOND_TAB_KEY] = True
-                        status.update(label="Análisis completo finalizado", state="complete")
-                    else:
-                        k = st.session_state["job"]
+    # 8) Ejecución controlada (SECUENCIAL para Análisis Completo)
+    if st.session_state["busy"]:
+        with st.status("Procesando análisis…", expanded=True) as status:
+            try:
+                if st.session_state["job_all"]:
+                    order = list(SECTION_SPECS.keys())
+                    st.session_state.setdefault("fs_sections", {})
+                    prog = st.progress(0.0)
+                    for i, k in enumerate(order, start=1):
                         spec = SECTION_SPECS[k]
                         status.update(label=f"Analizando sección: {spec['titulo']}…")
                         data, mode_used = _run_section_with_fallback(
@@ -906,36 +939,56 @@ def main():
                             temperature=FIXED_TEMPERATURE,
                             max_chars=LOCAL_CONTEXT_MAX_CHARS,
                         )
-                        st.session_state.setdefault("fs_sections", {})
                         st.session_state["fs_sections"][k] = data
-                        status.update(label=f"Sección '{spec['titulo']}' completada", state="complete")
-                finally:
-                    # Limpieza de estado y re-render limpio
-                    st.session_state["busy"] = False
-                    st.session_state["job"] = None
-                    st.session_state["job_all"] = False
-                    st.rerun()
+                        status.write(f"✓ {spec['titulo']} ({'File Search' if mode_used=='file_search' else 'Local'})")
+                        prog.progress(i/len(order))
+                    st.session_state[SECOND_TAB_KEY] = True
+                    status.update(label="Análisis completo finalizado", state="complete")
+                else:
+                    k = st.session_state["job"]
+                    spec = SECTION_SPECS[k]
+                    status.update(label=f"Analizando sección: {spec['titulo']}…")
+                    data, mode_used = _run_section_with_fallback(
+                        section_key=k,
+                        vs_id=st.session_state["fs_vs_id"],
+                        file_ids=st.session_state["fs_file_ids"],
+                        model=model,
+                        temperature=FIXED_TEMPERATURE,
+                        max_chars=LOCAL_CONTEXT_MAX_CHARS,
+                    )
+                    st.session_state.setdefault("fs_sections", {})
+                    st.session_state["fs_sections"][k] = data
+                    status.update(label=f"Sección '{spec['titulo']}' completada", state="complete")
+            finally:
+                st.session_state["busy"] = False
+                st.session_state["job"] = None
+                st.session_state["job_all"] = False
+                st.rerun()
 
-        # Visualización por sección
-        st.subheader("Resultados por sección")
-        if not st.session_state["busy"]:
-            for key, spec in SECTION_SPECS.items():
-                if "fs_sections" in st.session_state and key in st.session_state["fs_sections"]:
-                    with st.expander(spec["titulo"], expanded=False):
-                        st.json(st.session_state["fs_sections"][key])
-                        st.download_button(
-                            f"Descargar JSON – {spec['titulo']}",
-                            json.dumps(st.session_state["fs_sections"][key], indent=2, ensure_ascii=False),
-                            file_name=f"{key}.json",
-                            mime="application/json",
-                        )
-
-    with tab2:
-        fs_sections = st.session_state.get("fs_sections", {})
-        if not fs_sections:
-            st.info("Aún no hay resultados. Pulsa **Análisis Completo** o ejecuta alguna sección en la pestaña anterior.")
-        else:
-            render_full_view(fs_sections)
+    # 9) Vista completa (referencia) + descargas (sin JSON)
+    st.subheader("Resultados")
+    fs_sections = st.session_state.get("fs_sections", {})
+    if not fs_sections:
+        st.info("Aún no hay resultados. Pulsa **Análisis Completo** o ejecuta alguna sección arriba.")
+    else:
+        render_full_view(fs_sections)
+        col_a, col_b = st.columns(2)
+        with col_a:
+            st.download_button(
+                "Descargar JSON – Análisis completo",
+                json.dumps(fs_sections, indent=2, ensure_ascii=False),
+                file_name="analisis_completo.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        with col_b:
+            st.download_button(
+                "Descargar Markdown – Análisis completo",
+                _markdown_full(fs_sections),
+                file_name="analisis_completo.md",
+                mime="text/markdown",
+                use_container_width=True
+            )
 
 
 # ---------------------------------------------------------------------
