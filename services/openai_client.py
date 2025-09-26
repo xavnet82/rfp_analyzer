@@ -24,6 +24,36 @@ def _is_temperature_error(e: Exception) -> bool:
     s = str(e)
     return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
 
+def _is_unsupported_param(e: Exception, param: str) -> bool:
+    s = str(e)
+    return ("unsupported_parameter" in s or "Unsupported parameter" in s) and (param in s)
+
+def _responses_create_robust(args: dict):
+    """
+    Llama a Responses API y se auto-adapta:
+    - quita temperature si el modelo lo rechaza,
+    - quita response_format si el modelo lo rechaza,
+    - (por compat) cambia max_output_tokens -> max_completion_tokens si hace falta.
+    """
+    try:
+        return client.responses.create(**args)
+    except BadRequestError as e:
+        if _is_temperature_error(e):
+            args = dict(args)
+            args.pop("temperature", None)
+            return client.responses.create(**args)
+        if _is_unsupported_param(e, "response_format"):
+            args = dict(args)
+            args.pop("response_format", None)
+            return client.responses.create(**args)
+        if _is_unsupported_param(e, "max_output_tokens"):
+            args = dict(args)
+            val = args.pop("max_output_tokens", None)
+            if val is not None:
+                args["max_completion_tokens"] = val
+            return client.responses.create(**args)
+        raise  # otro 400: propaga
+        
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
     s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.IGNORECASE)
@@ -126,38 +156,42 @@ def _loads_json_robust(raw):
         return json.loads(brace)
     return obj
 
-@retry(wait=wait_exponential(multiplier=1, min=2, max=8), stop=stop_after_attempt(3), reraise=True)   # <--- añade esto
+@retry(wait=wait_exponential(multiplier=1, min=2, max=8),
+       stop=stop_after_attempt(3),
+       reraise=True)
 def _call_openai(model: Optional[str], system: str, user: str) -> str:
-    model = model or OPENAI_MODEL
+    model = (model or OPENAI_MODEL).strip()
+    is_gpt5 = model.lower().startswith("gpt-5")
 
-    # 1) Responses API (preferida)
+    # ---------- 1) Responses API (siempre preferida; obligatoria para gpt-5*) ----------
+    args = dict(
+        model=model,
+        input=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+        max_output_tokens=MAX_TOKENS_PER_REQUEST,
+        temperature=DEFAULT_TEMPERATURE,  # si el modelo lo rechaza, _responses_create_robust lo quita
+    )
+
     try:
-        args = dict(
-            model=model,
-            input=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            response_format={"type": "json_object"},
-            max_output_tokens=MAX_TOKENS_PER_REQUEST,
-            temperature=DEFAULT_TEMPERATURE,
-        )
-        try:
-            rsp = client.responses.create(**args)
-        except BadRequestError as e:
-            if _is_temperature_error(e):
-                args.pop("temperature", None)
-                rsp = client.responses.create(**args)
-            else:
-                raise
+        rsp = _responses_create_robust(args)
         text = _coalesce_text_from_responses(rsp)
         if not text:
-            raise RuntimeError("Responses API devolvió salida sin texto utilizable.")
+            # último intento: intentar extraer JSON del dump del objeto
+            dump = json.dumps(rsp, default=str)
+            try:
+                return _extract_json(dump)
+            except Exception:
+                raise RuntimeError("Responses API devolvió salida sin texto utilizable.")
         return text
-    except (TypeError, AttributeError, BadRequestError):
-        pass
+    except BadRequestError:
+        # si el modelo es gpt-5*, NO intentes Chat Completions -> propaga
+        if is_gpt5:
+            raise
 
-    # 2) Chat Completions (fallback)
+    # ---------- 2) Chat Completions (solo si NO es gpt-5*) ----------
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -181,34 +215,18 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
                 rsp = client.chat.completions.create(**kwargs)
                 content = _coalesce_text_from_chat(rsp)
                 if not content:
-                    # reintentar sin temperature si el modelo la rechaza
-                    kwargs_no_temp = dict(kwargs)
-                    kwargs_no_temp.pop("temperature", None)
-                    try:
-                        rsp = client.chat.completions.create(**kwargs_no_temp)
-                        content = _coalesce_text_from_chat(rsp)
-                    except BadRequestError as e2:
-                        msg2 = str(e2)
-                        if "unsupported_parameter" in msg2 or "Unsupported parameter" in msg2:
-                            last_error = e2
-                            continue
-                        raise
-                if not content:
-                    # último intento: parsear de la representación completa
-                    raw_dump = json.dumps(rsp, default=str)
-                    # si hubiera JSON embebido, lo extraemos
-                    try:
-                        return _extract_json(raw_dump)
-                    except Exception:
-                        raise RuntimeError("Chat Completions devolvió salida sin texto utilizable.")
-
+                    # último intento sin temperature (por si el modelo la rechaza)
+                    kwargs_no_temp = dict(kwargs); kwargs_no_temp.pop("temperature", None)
+                    rsp = client.chat.completions.create(**kwargs_no_temp)
+                    content = _coalesce_text_from_chat(rsp)
+                    if not content:
+                        raise RuntimeError("Chat Completions sin temperature devolvió salida sin texto utilizable.")
                 return content if use_rf else _extract_json(content)
 
             except BadRequestError as e:
                 if _is_temperature_error(e):
                     try:
-                        kwargs_no_temp = dict(kwargs)
-                        kwargs_no_temp.pop("temperature", None)
+                        kwargs_no_temp = dict(kwargs); kwargs_no_temp.pop("temperature", None)
                         rsp = client.chat.completions.create(**kwargs_no_temp)
                         content = _coalesce_text_from_chat(rsp)
                         if not content:
@@ -234,7 +252,6 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
         "Actualiza `openai` (>=1.43) o ajusta el modelo en la barra lateral. "
         f"Último error: {last_error!r}"
     )
-
 
 def analyze_text_chunk(accumulated: Optional[OfertaAnalizada],
                        chunk_text: str,
