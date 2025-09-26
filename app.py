@@ -247,7 +247,7 @@ def main():
         )
         # Temperatura oculta (determinista)
         temperature = DEFAULT_TEMPERATURE
-        )
+        
 
     _logs_init()
 
