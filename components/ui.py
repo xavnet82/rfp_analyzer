@@ -1,6 +1,6 @@
 import streamlit as st
 from typing import List
-from services.schema import OfertaAnalizada, Criterio, SeccionIndice, ImporteDetalle
+from services.schema import OfertaAnalizada, SeccionIndice
 
 def render_header(title: str):
     st.title(title)
