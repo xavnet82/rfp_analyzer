@@ -19,6 +19,11 @@ DEFAULT_TEMPERATURE = 0.2
 LOCAL_CONTEXT_MAX_CHARS = 40000
 MAX_TOKENS_PER_REQUEST = 1800
 
+# Verbosidad → tokens/contexto
+VERBOSITY_TOKENS = {1: 700, 2: 1000, 3: 1400, 4: 1800, 5: 2200}
+VERBOSITY_CTX_MULT = {1: 0.6, 2: 0.8, 3: 1.0, 4: 1.2, 5: 1.4}
+
+
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     st.error("Falta OPENAI_API_KEY")
@@ -167,8 +172,12 @@ def render_extra_fields(title: str, data: dict, used_keys: set):
                 st.markdown(f"**{header}:** {v}")
 
 # ---------- OpenAI calls ----------
-def file_input_call(user_prompt: str, model: str, temperature: float, file_ids: List[str], section_key: str):
+def file_input_call(user_prompt: str, model: str, temperature: float, file_ids: List[str], section_key: str, max_tokens: int, verbosity: int):
     sys_msg = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PREFIX}]}
+    style = (
+        "EJECUTIVO/CONCISO" if verbosity <= 2 else ("EQUILIBRADO" if verbosity == 3 else "DETALLADO/EXHAUSTIVO")
+    )
+    user_prompt = user_prompt + f"\n\n[NIVEL DE DETALLE]\n- Nivel: {verbosity} ({style}).\n- Si ejecutivo: síntesis en bullets cortos, sin adornos.\n- Si detallado: estructura clara, tablas/listas y referencias a páginas si procede."
     content = [{"type": "input_text", "text": user_prompt}]
     for fid in file_ids:
         content.append({"type": "input_file", "file_id": fid})
@@ -180,21 +189,21 @@ def file_input_call(user_prompt: str, model: str, temperature: float, file_ids: 
         model=model,
         input=[sys_msg, usr_msg],
         response_format={"type": "json_object"},
-        max_output_tokens=MAX_TOKENS_PER_REQUEST,
+        max_output_tokens=max_tokens,
         temperature=temperature,
     )
     rsp = responses_create_robust(client, args)
     txt = coalesce_text_from_responses(rsp) or json.dumps(rsp, default=str)
 
-    _log_event(section_key, model, temperature, prompt_text, (txt or "")[:200000], "input_file")
+    _log_event(section_key, f"{model} (v={verbosity}, maxtok={max_tokens})", temperature, prompt_text, (txt or "")[:200000], "input_file")
 
     return loads_robust(txt)
 
-def local_call(section_key: str, model: str, temperature: float, max_chars: int):
+def local_call(section_key: str, model: str, temperature: float, max_chars: int, max_tokens: int, verbosity: int):
     docs = st.session_state.get("local_docs", [])
     contexts = []
     for d in docs:
-        sel = select_relevant_spans(d["pages"], section_key, max_chars=max_chars)
+        sel = select_relevant_spans(d["pages"], section_key, max_chars=int(max_chars * VERBOSITY_CTX_MULT.get(verbosity,1.0)))
         if sel: contexts.append(sel)
     context = "\\n\\n".join(contexts)[:120000]
 
@@ -212,13 +221,13 @@ def local_call(section_key: str, model: str, temperature: float, max_chars: int)
         model=model,
         input=[sys_msg, usr_msg],
         response_format={"type": "json_object"},
-        max_output_tokens=MAX_TOKENS_PER_REQUEST,
+        max_output_tokens=max_tokens,
         temperature=temperature,
     )
     rsp = responses_create_robust(client, args)
     txt = coalesce_text_from_responses(rsp) or json.dumps(rsp, default=str)
 
-    _log_event(section_key, model, temperature, usr_text, (txt or "")[:200000], "local_fallback")
+    _log_event(section_key, f"{model} (v={verbosity}, maxtok={max_tokens})", temperature, usr_text, (txt or "")[:200000], "local_fallback")
 
     return loads_robust(txt)
 
@@ -284,17 +293,18 @@ def main():
 
         def run_one(k: str, show_spinner: bool = True):
             spec = SECTION_SPECS[k]
+            max_tokens = VERBOSITY_TOKENS.get(verbosity, MAX_TOKENS_PER_REQUEST)
             if show_spinner:
                 with st.spinner(f"Analizando: {spec['titulo']}…"):
                     try:
-                        data = file_input_call(SECTION_SPECS[k]["user_prompt"], model, temperature, file_ids, k)
+                        data = file_input_call(SECTION_SPECS[k]["user_prompt"], model, temperature, file_ids, k, max_tokens, verbosity)
                     except Exception:
-                        data = local_call(k, model, temperature, LOCAL_CONTEXT_MAX_CHARS)
+                        data = local_call(k, model, temperature, LOCAL_CONTEXT_MAX_CHARS, max_tokens, verbosity)
             else:
                 try:
-                    data = file_input_call(SECTION_SPECS[k]["user_prompt"], model, temperature, file_ids, k)
+                    data = file_input_call(SECTION_SPECS[k]["user_prompt"], model, temperature, file_ids, k, max_tokens, verbosity)
                 except Exception:
-                    data = local_call(k, model, temperature, LOCAL_CONTEXT_MAX_CHARS)
+                    data = local_call(k, model, temperature, LOCAL_CONTEXT_MAX_CHARS, max_tokens, verbosity)
             st.session_state["sections"][k] = data
 
         for k, pressed in btns.items():
