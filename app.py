@@ -1,6 +1,6 @@
 
-# app.py (main)
-import os, io, re, json, hashlib
+# app.py (main, fixed: progress + no experimental_rerun + better UX)
+import os, io, re, json
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -39,7 +39,8 @@ def login():
         if ok:
             if u == admin_user and p == admin_pass:
                 st.session_state["auth"] = True
-                st.rerun()
+                st.success("Acceso concedido.")
+                st.experimental_set_query_params(authed="1")  # hint
             else:
                 st.error("Credenciales inválidas.")
     st.stop()
@@ -162,7 +163,7 @@ def main():
     files = st.file_uploader("Sube PDF(s)", type=["pdf"], accept_multiple_files=True)
     if not files: st.stop()
 
-    # Subir a OpenAI + parsear local
+    # Subir a OpenAI + parsear local una sola vez
     if "file_ids" not in st.session_state:
         with st.spinner("Subiendo a OpenAI y preparando texto local…"):
             fids, local_docs = [], []
@@ -174,7 +175,7 @@ def main():
                 local_docs.append({"name": f.name, "pages": [clean_text(p) for p in pages]})
             st.session_state["file_ids"] = fids
             st.session_state["local_docs"] = local_docs
-        st.success("Listo.")
+        st.success("Vector store listo.")
 
     st.subheader("Ejecutar análisis")
     cols = st.columns(4)
@@ -194,23 +195,36 @@ def main():
     all_btn = st.button("🔎 Análisis completo", type="primary", use_container_width=True)
 
     st.session_state.setdefault("sections", {})
+    file_ids = st.session_state["file_ids"]
 
-    def run_one(k: str):
-        try:
-            data = file_input_call(SECTION_SPECS[k]["user_prompt"], model, temperature, st.session_state["file_ids"], k)
-        except Exception:
-            data = local_call(k, model, temperature, LOCAL_CONTEXT_MAX_CHARS)
+    def run_one(k: str, show_spinner: bool = True):
+        spec = SECTION_SPECS[k]
+        if show_spinner:
+            with st.spinner(f"Analizando: {spec['titulo']}…"):
+                try:
+                    data = file_input_call(SECTION_SPECS[k]["user_prompt"], model, temperature, file_ids, k)
+                except Exception:
+                    data = local_call(k, model, temperature, LOCAL_CONTEXT_MAX_CHARS)
+        else:
+            try:
+                data = file_input_call(SECTION_SPECS[k]["user_prompt"], model, temperature, file_ids, k)
+            except Exception:
+                data = local_call(k, model, temperature, LOCAL_CONTEXT_MAX_CHARS)
         st.session_state["sections"][k] = data
 
-    if all_btn:
-        for k in SECTION_SPECS.keys():
-            run_one(k)
-        st.experimental_rerun()
-
+    # Acciones botones individuales (sin rerun, mostramos resultados abajo)
     for k, pressed in btns.items():
         if pressed:
             run_one(k)
-            st.experimental_rerun()
+
+    # Botón análisis completo con progress bar
+    if all_btn:
+        keys = list(SECTION_SPECS.keys())
+        prog = st.progress(0.0, text="Ejecutando análisis completo…")
+        for i, k in enumerate(keys, start=1):
+            run_one(k, show_spinner=False)
+            prog.progress(i/len(keys), text=f"Ejecutando análisis completo… ({i}/{len(keys)})")
+        st.success("Análisis completo finalizado.")
 
     fs_sections = st.session_state.get("sections", {})
     if not fs_sections: st.stop()
