@@ -1,7 +1,5 @@
 import json
 import re
-from pydantic import ValidationError
-from services.schema import OfertaAnalizada
 from typing import Optional
 
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -11,96 +9,34 @@ from pydantic import ValidationError
 from services.schema import OfertaAnalizada
 from services.prompts import SYSTEM_PROMPT, USER_PROMPT
 from config import OPENAI_API_KEY, OPENAI_MODEL, MAX_TOKENS_PER_REQUEST
-DEFAULT_TEMPERATURE = 0.1  # usado sólo si el modelo lo soporta
 
 if not OPENAI_API_KEY:
-    raise RuntimeError(
-        "OPENAI_API_KEY no está configurada. Define la clave en `.env`, variables de entorno o st.secrets."
-    )
+    raise RuntimeError("OPENAI_API_KEY no está configurada.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-def _is_temperature_error(e: Exception) -> bool:
-    s = str(e)
-    return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
+DEFAULT_TEMPERATURE = 1.0  # se ignora si el modelo no lo soporta
 
-def _is_unsupported_param(e: Exception, param: str) -> bool:
-    s = str(e)
-    return ("unsupported_parameter" in s or "Unsupported parameter" in s) and (param in s)
-
-def _responses_create_robust(args: dict):
-    """
-    Llama a Responses API y se auto-adapta a variaciones del SDK/endpoint:
-    - quita temperature si el modelo lo rechaza,
-    - quita response_format si el SDK no lo soporta,
-    - cambia max_output_tokens -> max_completion_tokens si es necesario.
-    """
-    a = dict(args)
-    for _ in range(5):
-        try:
-            return client.responses.create(**a)
-        except (BadRequestError, TypeError) as e:
-            s = str(e)
-
-            # temperature no soportado (gpt-5* y otros)
-            if _is_temperature_error(e) or ("unexpected keyword" in s and "temperature" in s):
-                a.pop("temperature", None)
-                continue
-
-            # response_format no soportado por tu SDK Responses
-            if _is_unsupported_param(e, "response_format") or ("unexpected keyword" in s and "response_format" in s):
-                a.pop("response_format", None)
-                continue
-
-            # max_output_tokens no soportado (usar max_completion_tokens)
-            if _is_unsupported_param(e, "max_output_tokens") or ("unexpected keyword" in s and "max_output_tokens" in s):
-                val = a.pop("max_output_tokens", None)
-                if val is not None:
-                    a["max_completion_tokens"] = val
-                continue
-
-            # Si el error es de otro parámetro, propagar para que tenacity reintente
-            raise
-        
-def _strip_code_fences(s: str) -> str:
-    s = s.strip()
-    s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.IGNORECASE)
-    s = re.sub(r'\s*```\s*$', '', s)
-    return s
-
-def _coalesce_text_from_responses(rsp) -> str | None:
-    """
-    Intenta extraer texto de múltiples formas del objeto devuelto por la Responses API,
-    compatible con variaciones de SDK (output_text, output[*].content[*].text, choices...).
-    """
-    # 1) SDKs recientes
+def _coalesce_text_from_responses(rsp) -> Optional[str]:
     txt = getattr(rsp, "output_text", None)
     if txt:
         return txt
-
-    # 2) Recorrer bloques de salida
     out = getattr(rsp, "output", None)
     if out:
-        texts = []
+        parts = []
         for item in out:
-            # item.content suele ser una lista de bloques con .type y .text
             content = getattr(item, "content", None)
             if isinstance(content, list):
                 for block in content:
-                    # Algunas versiones usan .text; otras .value o dict-like
                     val = getattr(block, "text", None)
                     if val:
-                        texts.append(val)
-                    else:
-                        # acceso dict-like
-                        if isinstance(block, dict):
-                            t = block.get("text") or block.get("value")
-                            if t:
-                                texts.append(t)
-        if texts:
-            return "\n".join(texts)
-
-    # 3) Algunos SDKs dejan contenido en choices[0].message.content
+                        parts.append(val)
+                    elif isinstance(block, dict):
+                        v = block.get("text") or block.get("value")
+                        if v:
+                            parts.append(v)
+        if parts:
+            return "\n".join(parts)
     choices = getattr(rsp, "choices", None)
     if choices:
         msg = getattr(choices[0], "message", None)
@@ -108,13 +44,9 @@ def _coalesce_text_from_responses(rsp) -> str | None:
             content = getattr(msg, "content", None)
             if content:
                 return content
-
     return None
 
-def _coalesce_text_from_chat(rsp) -> str | None:
-    """
-    Extrae contenido de Chat Completions robustamente.
-    """
+def _coalesce_text_from_chat(rsp) -> Optional[str]:
     choices = getattr(rsp, "choices", None)
     if not choices:
         return None
@@ -122,12 +54,7 @@ def _coalesce_text_from_chat(rsp) -> str | None:
     if msg is None:
         return None
     content = getattr(msg, "content", None)
-    if content:
-        return content
-    # Últimos intentos por si el SDK usa dicts internos raros
-    if isinstance(msg, dict):
-        return msg.get("content")
-    return None
+    return content
 
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
@@ -164,15 +91,41 @@ def _loads_json_robust(raw):
         return json.loads(brace)
     return obj
 
+def _is_temperature_error(e: Exception) -> bool:
+    s = str(e)
+    return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
+
+def _is_unsupported_param(e: Exception, param: str) -> bool:
+    s = str(e)
+    return ("unsupported_parameter" in s or "Unexpected" in s or "unexpected" in s) and (param in s)
+
+def _responses_create_robust(args: dict):
+    a = dict(args)
+    for _ in range(5):
+        try:
+            return client.responses.create(**a)
+        except (BadRequestError, TypeError) as e:
+            s = str(e)
+            if _is_temperature_error(e) or ("unexpected keyword" in s and "temperature" in s):
+                a.pop("temperature", None); continue
+            if _is_unsupported_param(e, "response_format") or ("unexpected keyword" in s and "response_format" in s):
+                a.pop("response_format", None); continue
+            if _is_unsupported_param(e, "max_output_tokens") or ("unexpected keyword" in s and "max_output_tokens" in s):
+                val = a.pop("max_output_tokens", None)
+                if val is not None:
+                    a["max_completion_tokens"] = val
+                continue
+            raise
 
 @retry(wait=wait_exponential(multiplier=1, min=2, max=8),
        stop=stop_after_attempt(3),
        reraise=True)
-def _call_openai(model: Optional[str], system: str, user: str) -> str:
+def _call_openai(model: Optional[str], system: str, user: str, temperature: Optional[float] = None) -> str:
     model = (model or OPENAI_MODEL).strip()
     is_gpt5 = model.lower().startswith("gpt-5")
 
-    # ---------- 1) Responses API (preferida; OBLIGATORIA para gpt-5*) ----------
+    # 1) Responses API (preferida; obligatoria para gpt-5*)
+    eff_temp = DEFAULT_TEMPERATURE if temperature is None else float(temperature)
     args = dict(
         model=model,
         input=[
@@ -180,12 +133,11 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
             {"role": "user",   "content": user},
         ],
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
-        temperature=DEFAULT_TEMPERATURE,          # _responses_create_robust lo quitará si molesta
-        response_format={"type": "json_object"},  # _responses_create_robust lo quitará si no existe
+        temperature=eff_temp,
+        response_format={"type": "json_object"},
     )
-
-    # Para gpt-5*, evita pasar de inicio los kwargs conflictivos
     if is_gpt5:
+        # Muchos despliegues de gpt-5* no aceptan temperature != 1 ni response_format
         args.pop("temperature", None)
         args.pop("response_format", None)
 
@@ -200,42 +152,34 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
                 raise RuntimeError("Responses API devolvió salida sin texto utilizable.")
         return text
     except BadRequestError:
-        # Si el modelo es gpt-5*, NO intentes Chat Completions
         if is_gpt5:
             raise
 
-    # ---------- 2) Chat Completions (solo si NO es gpt-5*) ----------
+    # 2) Chat Completions (solo si NO es gpt-5*)
+    from config import MAX_TOKENS_PER_REQUEST as TOK
     messages = [
         {"role": "system", "content": system},
         {"role": "user",   "content": user},
     ]
-    token_params_order = ("max_output_tokens", "max_completion_tokens", "max_tokens")
-    response_format_options = (True, False)
-    last_error = None
-
-    for use_rf in response_format_options:
-        for token_param in token_params_order:
-            kwargs = dict(
-                model=model,
-                messages=messages,
-                temperature=DEFAULT_TEMPERATURE,
-            )
-            kwargs[token_param] = MAX_TOKENS_PER_REQUEST
+    for use_rf in (True, False):
+        for token_param in ("max_output_tokens", "max_completion_tokens", "max_tokens"):
+            kwargs = dict(model=model, messages=messages)
+            if temperature is not None:
+                kwargs["temperature"] = float(temperature)
+            kwargs[token_param] = TOK
             if use_rf:
                 kwargs["response_format"] = {"type": "json_object"}
-
             try:
                 rsp = client.chat.completions.create(**kwargs)
                 content = _coalesce_text_from_chat(rsp)
                 if not content:
-                    kwargs_no_temp = dict(kwargs)
-                    kwargs_no_temp.pop("temperature", None)
-                    rsp = client.chat.completions.create(**kwargs_no_temp)
-                    content = _coalesce_text_from_chat(rsp)
-                    if not content:
-                        raise RuntimeError("Chat Completions sin temperature devolvió salida sin texto utilizable.")
+                    if "temperature" in kwargs:
+                        kwargs_no_temp = dict(kwargs); kwargs_no_temp.pop("temperature", None)
+                        rsp = client.chat.completions.create(**kwargs_no_temp)
+                        content = _coalesce_text_from_chat(rsp)
+                        if not content:
+                            raise RuntimeError("Chat Completions sin temperature devolvió salida sin texto utilizable.")
                 return content if use_rf else _extract_json(content)
-
             except BadRequestError as e:
                 if _is_temperature_error(e):
                     try:
@@ -245,46 +189,28 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
                         if not content:
                             raise RuntimeError("Chat Completions sin temperature devolvió salida sin texto utilizable.")
                         return content if use_rf else _extract_json(content)
-                    except BadRequestError as e2:
-                        msg2 = str(e2)
-                        if "unsupported_parameter" in msg2 or "Unsupported parameter" in msg2:
-                            last_error = e2
-                            continue
-                        raise
-                msg = str(e)
-                if "unsupported_parameter" in msg or "Unsupported parameter" in msg:
-                    last_error = e
+                    except BadRequestError:
+                        continue
+                if _is_unsupported_param(e, token_param) or _is_unsupported_param(e, "response_format"):
                     continue
                 raise
-            except TypeError as e:
-                last_error = e
-                continue
-
-    raise RuntimeError(
-        "No fue posible realizar la llamada a OpenAI con los parámetros disponibles. "
-        "Actualiza `openai` (>=1.43) o ajusta el modelo en la barra lateral. "
-        f"Último error: {last_error!r}"
-    )
 
 def analyze_text_chunk(accumulated: Optional[OfertaAnalizada],
                        chunk_text: str,
-                       model: Optional[str] = None) -> OfertaAnalizada:
+                       model: Optional[str] = None,
+                       temperature: Optional[float] = None) -> OfertaAnalizada:
     user = USER_PROMPT.format(doc_text=chunk_text)
-    raw = _call_openai(model, SYSTEM_PROMPT, user)  # si falla, ahora verás la causa real
-    data = _loads_json_robust(raw)                  # parser robusto (el que ya añadiste)
-
+    raw = _call_openai(model, SYSTEM_PROMPT, user, temperature=temperature)
+    data = _loads_json_robust(raw)
     parsed = OfertaAnalizada.model_validate(data)
-
     if accumulated is None:
         return parsed
-    return merge_offers(accumulated, parsed)   # <-- llamada limpia
-
+    return merge_offers(accumulated, parsed)
 
 def merge_offers(base: OfertaAnalizada, new: OfertaAnalizada) -> OfertaAnalizada:
     from copy import deepcopy
     out = deepcopy(base)
 
-    # Resumen/objetivos/alcance
     if len((new.resumen_servicios or "")) > len((out.resumen_servicios or "")):
         out.resumen_servicios = new.resumen_servicios
     if new.objetivos:
@@ -294,7 +220,6 @@ def merge_offers(base: OfertaAnalizada, new: OfertaAnalizada) -> OfertaAnalizada
                 out.objetivos.append(o); seen.add(o)
     out.alcance = out.alcance or new.alcance
 
-    # Importes
     out.importe_total = new.importe_total or out.importe_total
     out.moneda = new.moneda or out.moneda
     seen_imp = {(d.concepto, d.importe, d.moneda) for d in (out.importes_detalle or [])}
@@ -303,7 +228,6 @@ def merge_offers(base: OfertaAnalizada, new: OfertaAnalizada) -> OfertaAnalizada
         if key not in seen_imp:
             out.importes_detalle.append(d); seen_imp.add(key)
 
-    # Criterios
     existing = {c.nombre: c for c in (out.criterios_valoracion or [])}
     for c in (new.criterios_valoracion or []):
         if c.nombre in existing:
@@ -317,7 +241,6 @@ def merge_offers(base: OfertaAnalizada, new: OfertaAnalizada) -> OfertaAnalizada
         else:
             out.criterios_valoracion.append(c)
 
-    # Índice solicitado
     titles_sol = {s.titulo: s for s in (out.indice_respuesta_tecnica or [])}
     for s in (new.indice_respuesta_tecnica or []):
         if s.titulo in titles_sol:
@@ -330,7 +253,6 @@ def merge_offers(base: OfertaAnalizada, new: OfertaAnalizada) -> OfertaAnalizada
         else:
             out.indice_respuesta_tecnica.append(s)
 
-    # Índice propuesto
     titles_prop = {s.titulo: s for s in (out.indice_propuesto or [])}
     for s in (new.indice_propuesto or []):
         if s.titulo in titles_prop:
@@ -343,11 +265,9 @@ def merge_offers(base: OfertaAnalizada, new: OfertaAnalizada) -> OfertaAnalizada
         else:
             out.indice_propuesto.append(s)
 
-    # Riesgos
     if new.riesgos_y_dudas and (not out.riesgos_y_dudas or len(new.riesgos_y_dudas) > len(out.riesgos_y_dudas)):
         out.riesgos_y_dudas = new.riesgos_y_dudas
 
-    # Páginas
     pages = set(out.referencias_paginas or [])
     for p in (new.referencias_paginas or []):
         pages.add(p)
