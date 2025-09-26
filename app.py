@@ -264,103 +264,169 @@ def create_vector_store_from_streamlit_files(files, name: str = "RFP Vector Stor
 # ---------------------------------------------------------------------
 # Secciones (prompts para File Search / Local)
 # ---------------------------------------------------------------------
-SECTION_SPECS: Dict[str, Dict[str, str]] = {
+SYSTEM_PREFIX = (
+    "Eres un analista sénior de licitaciones públicas en España. "
+    "Trabajas SOLO con la información contenida en los PDFs adjuntos. "
+    "Obligatorio: responde SIEMPRE con JSON VÁLIDO (UTF-8) y NADA MÁS. "
+    "Nunca inventes; si falta información, usa null o listas vacías. "
+    "Normaliza unidades y moneda; usa punto decimal (e.g., 12345.67). "
+    "Incluye referencias de página de donde extraes cada dato (si existen). "
+    "Si detectas inconsistencias, indícalas en un campo 'discrepancias' con breve explicación. "
+    "Optimiza por: precisión factual > concisión > completitud. "
+    "Evita repetir texto; sintetiza. "
+)
+
+SECTION_SPECS = {
     "objetivos_contexto": {
         "titulo": "Objetivos y contexto",
         "user_prompt": (
-            "Sobre los PDFs aportados, extrae OBJETIVOS y CONTEXTO del pliego. "
-            "Devuelve SOLO JSON con campos:\n"
+            "Analiza los PDFs y extrae OBJETIVOS y CONTEXTO. "
+            "Prioriza los apartados tipo 'Objeto del contrato', 'Alcance', 'Descripción del servicio', 'Contexto'. "
+            "Devuelve SOLO JSON con esta estructura (mantén claves, añade solo los opcionales si hay datos):\n"
             "{\n"
-            '  "resumen_servicios": str|null,\n'
-            '  "objetivos": [str],\n'
-            '  "alcance": str|null,\n'
-            '  "referencias_paginas": [int]\n'
-            "}"
+            '  "resumen_servicios": str|null,             // síntesis ejecutiva (máx. 120-150 palabras)\n'
+            '  "objetivos": [str],                        // 5-12 bullets, accionables\n'
+            '  "alcance": str|null,                       // qué incluye; si hay límites, resume en 1-2 frases\n'
+            '  "referencias_paginas": [int],              // páginas únicas, orden ascendente\n'
+            '  "evidencias": [{"pagina": int, "cita": str}],  // 1-3 citas cortas literales\n'
+            '  "discrepancias": [str]                     // conflictos, ambigüedades o lagunas\n'
+            "}\n"
+            "Reglas: no especules; si los objetivos/alcance no aparecen, deja null/[]; "
+            "las citas deben ser breves (≤240 caracteres)."
         ),
     },
     "servicios": {
         "titulo": "Servicios solicitados (detalle)",
         "user_prompt": (
-            "Sobre los PDFs, lista los SERVICIOS SOLICITADOS con detalle. "
-            "Devuelve SOLO JSON con campos:\n"
+            "Identifica y lista los SERVICIOS SOLICITADOS con el máximo detalle. "
+            "Busca secciones de 'Servicios', 'Actividades', 'Tareas', 'Entregables', 'SLA/KPI', 'Periodicidad', 'Volumen'. "
+            "Devuelve SOLO JSON:\n"
             "{\n"
-            '  "resumen_servicios": str|null,\n'
-            '  "servicios_detalle": [{"nombre": str, "descripcion": str|null}],\n'
+            '  "resumen_servicios": str|null, \n'
+            '  "servicios_detalle": [\n'
+            '    {\n'
+            '      "nombre": str,                         // etiqueta sintética del servicio\n'
+            '      "descripcion": str|null,               // 1-3 frases precisas\n'
+            '      "entregables": [str],                  // opcional\n'
+            '      "requisitos": [str],                   // SLAs/KPIs/NFRs si aparecen\n'
+            '      "periodicidad": str|null,              // p.ej., mensual, semanal, bajo demanda\n'
+            '      "volumen": str|null,                   // p.ej., #usuarios, #horas, #tickets/mes\n'
+            '      "ubicacion_modalidad": str|null        // remoto/presencial, on-site/off-site\n'
+            "    }\n"
+            "  ],\n"
             '  "alcance": str|null,\n'
-            '  "referencias_paginas": [int]\n'
-            "}"
+            '  "referencias_paginas": [int],\n'
+            '  "evidencias": [{"pagina": int, "cita": str}],\n'
+            '  "discrepancias": [str]\n'
+            "}\n"
+            "Reglas: deduplica servicios equivalentes; sintetiza; si algún campo no aparece, déjalo null/[]."
         ),
     },
     "importe": {
         "titulo": "Importe de licitación",
         "user_prompt": (
-            "Extrae el IMPORTE DE LICITACIÓN. Devuelve SOLO JSON:\n"
+            "Extrae importes: presupuesto base de licitación, posibles anualidades/prórrogas, e IVA si se explicita. "
+            "Normaliza a número decimal con punto y devuelve moneda detectada. "
+            "Devuelve SOLO JSON:\n"
             "{\n"
-            '  "importe_total": float|null,\n'
-            '  "moneda": str|null,\n'
-            '  "importes_detalle": [{"concepto": str|null, "importe": float|null, "moneda": str|null, "observaciones": str|null}],\n'
-            '  "referencias_paginas": [int]\n'
+            '  "importe_total": float|null,               // total principal indicado (siempre que sea inequívoco)\n'
+            '  "moneda": str|null,                        // p.ej., EUR\n'
+            '  "importes_detalle": [\n'
+            '    {"concepto": str|null, "importe": float|null, "moneda": str|null, "observaciones": str|null}\n'
+            '  ],\n'
+            '  "referencias_paginas": [int],\n'
+            '  "evidencias": [{"pagina": int, "cita": str}],\n'
+            '  "discrepancias": [str]\n'
             "}\n"
-            "Usa punto decimal. Si hay base/IVA/prórrogas/anualidades, inclúyelos."
+            "Reglas: si hay varios importes (p.ej., por anualidad/prórroga), incluye cada uno en importes_detalle con observaciones. "
+            "Si no hay cifra clara, usa null y explica en 'discrepancias'."
         ),
     },
     "criterios_valoracion": {
         "titulo": "Criterios de valoración",
         "user_prompt": (
-            "Extrae CRITERIOS DE VALORACIÓN y subcriterios con máximos/pesos. Devuelve SOLO JSON:\n"
+            "Extrae criterios de valoración y subcriterios, con pesos máximos y tipo (puntos o porcentaje). "
+            "Si el pliego mezcla unidades, indica el valor numérico y el tipo. "
+            "Devuelve SOLO JSON:\n"
             "{\n"
             '  "criterios_valoracion": [\n'
-            '    {"nombre": str, "peso_max": float|null, "tipo": str|null,\n'
-            '     "subcriterios": [{"nombre": str, "peso_max": float|null, "tipo": str|null, "observaciones": str|null}]}\n'
+            '    {\n'
+            '      "nombre": str,\n'
+            '      "peso_max": float|null,                // valor numérico del peso\n'
+            '      "tipo": str|null,                      // \"puntos\" | \"porcentaje\" | null\n'
+            '      "subcriterios": [\n'
+            '        {"nombre": str, "peso_max": float|null, "tipo": str|null, "observaciones": str|null}\n'
+            '      ]\n'
+            '    }\n'
             '  ],\n'
-            '  "referencias_paginas": [int]\n'
+            '  "referencias_paginas": [int],\n'
+            '  "evidencias": [{"pagina": int, "cita": str}],\n'
+            '  "discrepancias": [str]\n'
             "}\n"
+            "Reglas: conserva la jerarquía; deduplica; si el peso se expresa en texto, extrae el número si es inequívoco."
         ),
     },
     "indice_tecnico": {
         "titulo": "Índice de la respuesta técnica",
         "user_prompt": (
-            "Extrae el ÍNDICE SOLICITADO de la respuesta técnica (literal del pliego) "
-            "y propone un ÍNDICE ALINEADO. Devuelve SOLO JSON:\n"
+            "1) Extrae el ÍNDICE SOLICITADO literal del pliego. "
+            "2) Propón un ÍNDICE ALINEADO (títulos claros, 1-2 líneas de descripción, subapartados concretos). "
+            "Devuelve SOLO JSON:\n"
             "{\n"
-            '  "indice_respuesta_tecnica": [{"titulo": str, "descripcion": str|null, "subapartados": [str]}],\n'
-            '  "indice_propuesto": [{"titulo": str, "descripcion": str|null, "subapartados": [str]}],\n'
-            '  "referencias_paginas": [int]\n'
+            '  "indice_respuesta_tecnica": [\n'
+            '    {"titulo": str, "descripcion": str|null, "subapartados": [str]}\n'
+            '  ],\n'
+            '  "indice_propuesto": [\n'
+            '    {"titulo": str, "descripcion": str|null, "subapartados": [str]}\n'
+            '  ],\n'
+            '  "trazabilidad": [                          // opcional: mapea propuesto→solicitado\n'
+            '    {"propuesto": str, "solicitado_match": str|null}\n'
+            '  ],\n'
+            '  "referencias_paginas": [int],\n'
+            '  "evidencias": [{"pagina": int, "cita": str}],\n'
+            '  "discrepancias": [str]\n'
             "}\n"
+            "Reglas: el índice propuesto debe cubrir lo solicitado; evita ruido y redundancias; "
+            "si el pliego no define índice, indícalo y propone uno compacto y justificable."
         ),
     },
     "riesgos_exclusiones": {
         "titulo": "Riesgos y exclusiones",
         "user_prompt": (
-            "Identifica RIESGOS, DUDAS, EXCLUSIONES o incompatibilidades del pliego. Devuelve SOLO JSON:\n"
+            "Identifica RIESGOS (contractuales, técnicos/operativos, plazos, dependencias) y EXCLUSIONES. "
+            "Devuelve SOLO JSON:\n"
             "{\n"
-            '  "riesgos_y_dudas": str|null,\n'
-            '  "exclusiones": [str],\n'
-            '  "referencias_paginas": [int]\n'
+            '  "riesgos_y_dudas": str|null,               // síntesis de 3-6 frases\n'
+            '  "exclusiones": [str],                      // literal o parafraseado fiel\n'
+            '  "referencias_paginas": [int],\n'
+            '  "evidencias": [{"pagina": int, "cita": str}],\n'
+            '  "discrepancias": [str]\n'
             "}\n"
+            "Reglas: no inventes; si no hay exclusiones explícitas, devuelve []."
         ),
     },
     "solvencia": {
         "titulo": "Criterios de solvencia",
         "user_prompt": (
-            "Extrae criterios de SOLVENCIA (técnica, económica, administrativa). Devuelve SOLO JSON:\n"
+            "Extrae criterios de SOLVENCIA (técnica, económica, administrativa/otros). "
+            "Reconoce sinónimos (p.ej., 'capacidad', 'experiencia mínima', 'clasificación empresarial'). "
+            "Devuelve SOLO JSON:\n"
             "{\n"
             '  "solvencia": {\n'
             '    "tecnica": [str],\n'
             '    "economica": [str],\n'
             '    "administrativa": [str]\n'
             "  },\n"
-            '  "referencias_paginas": [int]\n'
+            '  "referencias_paginas": [int],\n'
+            '  "evidencias": [{"pagina": int, "cita": str}],\n'
+            '  "discrepancias": [str]\n'
             "}\n"
+            "Reglas: devuelve bullets atómicos (una condición por elemento); si no hay datos, [] en la categoría correspondiente."
         ),
     },
 }
 
-SYSTEM_PREFIX = (
-    "Eres un analista experto en licitaciones públicas en España. "
-    "Debes responder SIEMPRE con JSON válido (sin texto adicional). "
-    "Si algo no aparece en los PDFs, devuelve null o listas vacías."
-)
+
 
 # ---------------------------------------------------------------------
 # Selección de páginas relevantes por sección (acelera local)
