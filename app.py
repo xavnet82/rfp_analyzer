@@ -77,7 +77,7 @@ def _strip_code_fences(s: str) -> str:
     return s
 
 def _extract_json_block(text: str) -> str:
-    m = re.search(r"\{.*\}", text, re.DOTALL)
+    m = re.search(r"\{[\s\S]*\}", text)
     if not m:
         raise RuntimeError("La respuesta del modelo no contiene JSON parseable.")
     return m.group(0)
@@ -97,9 +97,11 @@ def _json_loads_robust(raw: Any) -> Any:
         return json.loads(brace)
 
 def _coalesce_text_from_responses(rsp) -> Optional[str]:
+    # 1) Propiedad estándar
     txt = getattr(rsp, "output_text", None)
     if txt:
         return txt
+    # 2) Recorrer bloques (output / content / text)
     out = getattr(rsp, "output", None)
     if out:
         parts = []
@@ -114,6 +116,20 @@ def _coalesce_text_from_responses(rsp) -> Optional[str]:
                         v = block.get("text") or block.get("value")
                         if v:
                             parts.append(v)
+        if parts:
+            return "\n".join(parts)
+    # 3) A veces el SDK expone message único
+    msg = getattr(rsp, "message", None)
+    if msg and isinstance(getattr(msg, "content", None), list):
+        parts = []
+        for block in msg.content:
+            val = getattr(block, "text", None)
+            if val:
+                parts.append(val)
+            elif isinstance(block, dict):
+                v = block.get("text") or block.get("value")
+                if v:
+                    parts.append(v)
         if parts:
             return "\n".join(parts)
     return None
@@ -306,6 +322,53 @@ SYSTEM_PREFIX = (
     "Si algo no aparece en los PDFs, devuelve null o listas vacías."
 )
 
+# ---------------- Conversión a JSON forzada (segunda llamada) ----------------
+def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: str, temperature: Optional[float]):
+    """
+    Si el modelo devolvió texto no JSON, hacemos una 2ª llamada sin herramientas para
+    convertir a JSON válido según el esquema descrito en el prompt de la sección.
+    """
+    schema_hint = ""
+    if section_key and section_key in SECTION_SPECS:
+        # Reutilizamos el bloque de esquema embebido en el user_prompt
+        schema_hint = SECTION_SPECS[section_key]["user_prompt"]
+
+    sys_msg = {
+        "role": "system",
+        "content": [{"type": "input_text", "text": "Devuelve SOLO un JSON válido (UTF-8), sin texto adicional."}],
+    }
+    usr_msg = {
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": (
+                "Convierte estrictamente la siguiente respuesta a JSON válido que cumpla el esquema indicado. "
+                "Si falta información, usa null o listas vacías. "
+                f"\n\n[ESQUEMA]\n{schema_hint}\n\n[RESPUESTA]\n<<<\n{raw_text}\n>>>\n"
+            ),
+        }],
+    }
+
+    args = dict(
+        model=(model or OPENAI_MODEL).strip(),
+        input=[sys_msg, usr_msg],
+        response_format={"type": "json_object"},
+        max_output_tokens=MAX_TOKENS_PER_REQUEST,
+    )
+    if temperature is not None:
+        args["temperature"] = float(temperature)
+    # Modelos gpt-5: suelen rechazar response_format/temperature ≠ 1
+    if args["model"].lower().startswith("gpt-5"):
+        args.pop("temperature", None)
+        args.pop("response_format", None)
+
+    rsp = _responses_create_robust(args)
+    text = _coalesce_text_from_responses(rsp)
+    if not text:
+        dump = json.dumps(rsp, default=str)
+        text = _extract_json_block(dump)
+    return _json_loads_robust(text)
+
 
 def _file_search_section_call(
     vector_store_id: str,                 # no usado aquí, se mantiene por compatibilidad
@@ -313,11 +376,13 @@ def _file_search_section_call(
     model: str,
     temperature: Optional[float] = None,
     file_ids: Optional[List[str]] = None,
+    section_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Lanza una llamada a Responses+FileSearch para una sección concreta y devuelve dict.
     IMPORTANTE: sin 'tool_resources' (algunos endpoints lo rechazan).
     Usamos 'attachments' + 'tools' (y _responses_create_robust lo moverá a extra_body si hace falta).
+    Si el texto devuelto no es JSON, se fuerza a JSON con una 2ª llamada sin herramientas.
     """
     if not file_ids:
         raise RuntimeError("No hay file_ids para adjuntar a la llamada. Reindexa los PDFs.")
@@ -345,10 +410,22 @@ def _file_search_section_call(
 
     rsp = _responses_create_robust(args)
     text = _coalesce_text_from_responses(rsp)
+
+    # Si no hay texto, intentamos rascar JSON del dump crudo
     if not text:
         dump = json.dumps(rsp, default=str)
-        text = _extract_json_block(dump)
-    return _json_loads_robust(text)
+        try:
+            text = _extract_json_block(dump)
+            return _json_loads_robust(text)
+        except Exception:
+            # Forzamos conversión a JSON con 2ª llamada
+            return _force_jsonify_from_text(section_key, dump, model, temperature)
+
+    # Intentamos parsear; si falla, forzamos conversión
+    try:
+        return _json_loads_robust(text)
+    except Exception:
+        return _force_jsonify_from_text(section_key, text, model, temperature)
 
 
 # ---------------------------------------------------------------------
@@ -441,12 +518,17 @@ def _run_section_with_fallback(section_key: str, vs_id: str, file_ids: List[str]
             model=model,
             temperature=temperature,
             file_ids=file_ids,
+            section_key=section_key,
         )
         return data, "file_search"
     except Exception as e:
         msg = str(e)
         if ("Unknown parameter: 'attachments'" in msg) or ("Unknown parameter: 'tool_resources'" in msg) \
            or ("unknown_parameter" in msg) or ("unsupported" in msg.lower()):
+            data = _fallback_local_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
+            return data, "local_fallback"
+        # Si falló por no-JSON u otro formato, también hacemos fallback local
+        if ("no contiene JSON" in msg) or ("cadena vacía" in msg) or ("Respuesta vacía" in msg):
             data = _fallback_local_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
             return data, "local_fallback"
         raise
@@ -660,7 +742,7 @@ def main():
                 )
             st.session_state["fs_sections"][section_key] = data
             if mode_used == "local_fallback":
-                st.warning(f"Sección '{spec['titulo']}' analizada con **fallback local** (el endpoint no admite File Search en Responses).")
+                st.warning(f"Sección '{spec['titulo']}' analizada con **fallback local** (endpoint sin File Search en Responses o sin JSON).")
             else:
                 st.info(f"Sección '{spec['titulo']}' analizada con **File Search**.")
 
