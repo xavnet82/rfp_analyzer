@@ -30,29 +30,37 @@ def _is_unsupported_param(e: Exception, param: str) -> bool:
 
 def _responses_create_robust(args: dict):
     """
-    Llama a Responses API y se auto-adapta:
+    Llama a Responses API y se auto-adapta a variaciones del SDK/endpoint:
     - quita temperature si el modelo lo rechaza,
-    - quita response_format si el modelo lo rechaza,
-    - (por compat) cambia max_output_tokens -> max_completion_tokens si hace falta.
+    - quita response_format si el SDK no lo soporta,
+    - cambia max_output_tokens -> max_completion_tokens si es necesario.
     """
-    try:
-        return client.responses.create(**args)
-    except BadRequestError as e:
-        if _is_temperature_error(e):
-            args = dict(args)
-            args.pop("temperature", None)
-            return client.responses.create(**args)
-        if _is_unsupported_param(e, "response_format"):
-            args = dict(args)
-            args.pop("response_format", None)
-            return client.responses.create(**args)
-        if _is_unsupported_param(e, "max_output_tokens"):
-            args = dict(args)
-            val = args.pop("max_output_tokens", None)
-            if val is not None:
-                args["max_completion_tokens"] = val
-            return client.responses.create(**args)
-        raise  # otro 400: propaga
+    a = dict(args)
+    for _ in range(5):
+        try:
+            return client.responses.create(**a)
+        except (BadRequestError, TypeError) as e:
+            s = str(e)
+
+            # temperature no soportado (gpt-5* y otros)
+            if _is_temperature_error(e) or ("unexpected keyword" in s and "temperature" in s):
+                a.pop("temperature", None)
+                continue
+
+            # response_format no soportado por tu SDK Responses
+            if _is_unsupported_param(e, "response_format") or ("unexpected keyword" in s and "response_format" in s):
+                a.pop("response_format", None)
+                continue
+
+            # max_output_tokens no soportado (usar max_completion_tokens)
+            if _is_unsupported_param(e, "max_output_tokens") or ("unexpected keyword" in s and "max_output_tokens" in s):
+                val = a.pop("max_output_tokens", None)
+                if val is not None:
+                    a["max_completion_tokens"] = val
+                continue
+
+            # Si el error es de otro parámetro, propagar para que tenacity reintente
+            raise
         
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
@@ -156,6 +164,7 @@ def _loads_json_robust(raw):
         return json.loads(brace)
     return obj
 
+
 @retry(wait=wait_exponential(multiplier=1, min=2, max=8),
        stop=stop_after_attempt(3),
        reraise=True)
@@ -163,23 +172,27 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
     model = (model or OPENAI_MODEL).strip()
     is_gpt5 = model.lower().startswith("gpt-5")
 
-    # ---------- 1) Responses API (siempre preferida; obligatoria para gpt-5*) ----------
+    # ---------- 1) Responses API (preferida; OBLIGATORIA para gpt-5*) ----------
     args = dict(
         model=model,
         input=[
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            {"role": "user",   "content": user},
         ],
-        response_format={"type": "json_object"},
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
-        temperature=DEFAULT_TEMPERATURE,  # si el modelo lo rechaza, _responses_create_robust lo quita
+        temperature=DEFAULT_TEMPERATURE,          # _responses_create_robust lo quitará si molesta
+        response_format={"type": "json_object"},  # _responses_create_robust lo quitará si no existe
     )
+
+    # Para gpt-5*, evita pasar de inicio los kwargs conflictivos
+    if is_gpt5:
+        args.pop("temperature", None)
+        args.pop("response_format", None)
 
     try:
         rsp = _responses_create_robust(args)
         text = _coalesce_text_from_responses(rsp)
         if not text:
-            # último intento: intentar extraer JSON del dump del objeto
             dump = json.dumps(rsp, default=str)
             try:
                 return _extract_json(dump)
@@ -187,14 +200,14 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
                 raise RuntimeError("Responses API devolvió salida sin texto utilizable.")
         return text
     except BadRequestError:
-        # si el modelo es gpt-5*, NO intentes Chat Completions -> propaga
+        # Si el modelo es gpt-5*, NO intentes Chat Completions
         if is_gpt5:
             raise
 
     # ---------- 2) Chat Completions (solo si NO es gpt-5*) ----------
     messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": user},
+        {"role": "user",   "content": user},
     ]
     token_params_order = ("max_output_tokens", "max_completion_tokens", "max_tokens")
     response_format_options = (True, False)
@@ -215,8 +228,8 @@ def _call_openai(model: Optional[str], system: str, user: str) -> str:
                 rsp = client.chat.completions.create(**kwargs)
                 content = _coalesce_text_from_chat(rsp)
                 if not content:
-                    # último intento sin temperature (por si el modelo la rechaza)
-                    kwargs_no_temp = dict(kwargs); kwargs_no_temp.pop("temperature", None)
+                    kwargs_no_temp = dict(kwargs)
+                    kwargs_no_temp.pop("temperature", None)
                     rsp = client.chat.completions.create(**kwargs_no_temp)
                     content = _coalesce_text_from_chat(rsp)
                     if not content:
