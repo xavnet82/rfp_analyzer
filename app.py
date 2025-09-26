@@ -438,25 +438,6 @@ SECTION_SPECS = {
 # ---------------------------------------------------------------------
 # Selección de páginas relevantes por sección (acelera local)
 # ---------------------------------------------------------------------
-SECTION_KEYWORDS.update({
-    "indice_tecnico": {
-        "índice": 6, "indice": 6, "estructura": 5, "estructura mínima": 6,
-        "contenido de la oferta": 6, "contenido mínimo": 6, "memoria técnica": 5,
-        "documentación técnica": 5, "apartados": 4, "secciones": 4,
-        "instrucciones de preparación": 5, "formato de la propuesta": 5,
-        "orden de contenidos": 5, "capítulos": 4, "anexos": 3,
-        "presentación de ofertas": 4, "sobre técnico": 5
-    },
-    "riesgos_exclusiones": {
-        "exclusiones": 7, "no incluye": 7, "quedan excluidos": 7,
-        "no serán objeto": 6, "limitaciones": 5, "incompatibilidades": 5,
-        "responsabilidad": 4, "exenciones": 4, "penalizaciones": 4,
-        "causas de exclusión": 6, "supuestos de exclusión": 6,
-        "condiciones especiales": 4, "garantías": 4, "plazos": 4,
-        "régimen sancionador": 5, "riesgos": 4, "restricciones": 4
-    },
-})
-
 SECTION_CONTEXT_TUNING = {
     # max chars por doc y ventana de páginas para _select_relevant_spans
     "indice_tecnico": {"max_chars": 80000, "window": 2},
