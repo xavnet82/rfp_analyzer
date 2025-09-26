@@ -149,27 +149,31 @@ def _responses_create_robust(args: dict):
                 continue
             raise
 
-def create_vector_store_from_streamlit_files(files, name: str = "RFP Vector Store") -> str:
+def create_vector_store_from_streamlit_files(files, name: str = "RFP Vector Store"):
     """
-    Sube los PDFs a OpenAI y los indexa en un Vector Store.
-    Devuelve el vector_store_id.
+    Sube los PDFs a OpenAI, los indexa en un Vector Store y
+    devuelve (vector_store_id, file_ids) para usar 'attachments' si tu SDK
+    no soporta tool_resources.
     """
     store = _oai_client.vector_stores.create(
         name=name,
-        expires_after={"anchor": "last_active_at", "days": 2},  # opcional: caducidad
-        # chunking_strategy={"type": "static", "static": {"max_chunk_size_tokens": 1600, "chunk_overlap_tokens": 400}},
+        expires_after={"anchor": "last_active_at", "days": 2},  # opcional
     )
+
+    file_ids = []
     for f in files:
         data = f.read()
         up = _oai_client.files.create(
             file=(f.name, data, "application/pdf"),
             purpose="assistants"
         )
+        file_ids.append(up.id)
         _oai_client.vector_stores.files.create_and_poll(
             vector_store_id=store.id,
             file_id=up.id
         )
-    return store.id
+
+    return store.id, file_ids
 
 # ---- Secciones: prompts específicos ----
 SECTION_SPECS: Dict[str, Dict[str, str]] = {
@@ -277,20 +281,25 @@ def _file_search_section_call(
     user_prompt: str,
     model: str,
     temperature: Optional[float] = None,
+    file_ids: Optional[list[str]] = None,
 ) -> Dict[str, Any]:
     """
     Lanza una llamada a Responses+FileSearch para una sección concreta y devuelve dict.
-    Autoadapta parámetros (temperature/response_format/max_output_tokens).
+    1º intento: tool_resources (vector store).
+    Fallback si el SDK no lo soporta: attachments con file_ids.
     """
+
     model = (model or OPENAI_MODEL).strip()
     is_gpt5 = model.lower().startswith("gpt-5")
 
+    # Input en formato "content parts" (más compatible entre SDKs)
+    sys_msg = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PREFIX}]}
+    usr_msg = {"role": "user",   "content": [{"type": "input_text", "text": user_prompt}]}
+
+    # ---------- Intento A: tool_resources (vector store) ----------
     args = dict(
         model=model,
-        input=[
-            {"role": "system", "content": SYSTEM_PREFIX},
-            {"role": "user", "content": user_prompt},
-        ],
+        input=[sys_msg, usr_msg],
         tools=[{"type": "file_search"}],
         tool_resources={"file_search": {"vector_store_ids": [vector_store_id]}},
         response_format={"type": "json_object"},
@@ -298,18 +307,51 @@ def _file_search_section_call(
     )
     if temperature is not None:
         args["temperature"] = float(temperature)
-
     if is_gpt5:
-        # Muchos despliegues gpt-5* rechazan temperature != 1 y response_format
         args.pop("temperature", None)
         args.pop("response_format", None)
 
-    rsp = _responses_create_robust(args)
+    try:
+        rsp = _responses_create_robust(args)
+        text = _coalesce_text_from_responses(rsp)
+        if not text:
+            dump = json.dumps(rsp, default=str)
+            text = _extract_json_block(dump)
+        return _json_loads_robust(text)
+    except (BadRequestError, TypeError) as e:
+        # Si el SDK no soporta tool_resources, caemos al plan B (attachments)
+        if "tool_resources" not in str(e):
+            # otro error real -> propaga
+            raise
+
+    # ---------- Intento B: attachments (sin vector store) ----------
+    if not file_ids:
+        raise RuntimeError(
+            "El SDK no soporta 'tool_resources' y no hay 'file_ids' para usar 'attachments'. "
+            "Vuelve a indexar guardando file_ids."
+        )
+
+    args_b = dict(
+        model=model,
+        input=[sys_msg, usr_msg],
+        tools=[{"type": "file_search"}],
+        attachments=[{"file_id": fid, "tools": [{"type": "file_search"}]} for fid in file_ids],
+        response_format={"type": "json_object"},
+        max_output_tokens=MAX_TOKENS_PER_REQUEST,
+    )
+    if temperature is not None:
+        args_b["temperature"] = float(temperature)
+    if is_gpt5:
+        args_b.pop("temperature", None)
+        args_b.pop("response_format", None)
+
+    rsp = _responses_create_robust(args_b)
     text = _coalesce_text_from_responses(rsp)
     if not text:
         dump = json.dumps(rsp, default=str)
         text = _extract_json_block(dump)
     return _json_loads_robust(text)
+
 
 
 # =============================================================================
