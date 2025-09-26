@@ -1,183 +1,519 @@
+# app.py
+# -----------------------------------------------------------------------------------
+# RFP Analyzer – Streamlit (consultoría TI) | "PDF completo" + fallback local
+# - Modelos visibles: gpt-4o y gpt-4o-mini (temperatura configurable desde sidebar)
+# - UX de una sola vista de análisis + una pestaña de "Registro (Prompts/Respuestas)"
+# - Envío de PDFs como input_file a /responses (sin tools ni attachments)
+# - Fallback local con selección de páginas relevantes y síntesis garantizada
+# - Prompts robustos: JSON obligatorio, evidencias, discrepancias, no alucinar
+# - Incluye “Formato y entrega de la oferta”
+# - Log tab: expander para TODAS las secciones (incluida Formato/Entrega)
+# - Índice técnico: ahora se renderiza título + descripción + subapartados
+# -----------------------------------------------------------------------------------
 
-# app.py (main, +Recargar ficheros +Logs tab +UX estable)
-import os, io, re, json
-from datetime import datetime
+import os
+import io
+import re
+import json
+import hashlib
 from typing import Any, Dict, List, Optional, Tuple
 
 import streamlit as st
-from openai import OpenAI
 
-from services.pdf_loader import extract_pdf_text
-from services.openai_client import create_client, responses_create_robust, coalesce_text_from_responses
-from prompts.specs import SYSTEM_PREFIX, SECTION_SPECS, SECTION_CONTEXT_TUNING, SECTION_KEYWORDS
-from utils.text import clean_text, bullets
-from ui.render import badge, render_index, resumen_ejecutivo
-
+# -----------------------------------------------------------------------------------
+# Config (intenta importar config.py; si no, usa defaults/env)
+# -----------------------------------------------------------------------------------
 APP_TITLE = "RFP Analyzer (Consultoría TI)"
-AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini"]
+OPENAI_MODEL_DEFAULT = "gpt-4o"
+OPENAI_API_KEY = None
+ADMIN_USER = "admin"
+ADMIN_PASSWORD = "rfpanalyzer"
+MAX_TOKENS_PER_REQUEST = 1800  # salida de cada sección (JSON)
 DEFAULT_TEMPERATURE = 0.2
-LOCAL_CONTEXT_MAX_CHARS = 40000
-MAX_TOKENS_PER_REQUEST = 1800
 
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("Falta OPENAI_API_KEY")
-    st.stop()
+try:
+    from config import (  # type: ignore
+        APP_TITLE as _APP_TITLE,
+        OPENAI_MODEL as _OPENAI_MODEL,
+        OPENAI_API_KEY as _OPENAI_API_KEY,
+        ADMIN_USER as _ADMIN_USER,
+        ADMIN_PASSWORD as _ADMIN_PASSWORD,
+        MAX_TOKENS_PER_REQUEST as _MAX_TOKENS,
+    )
+    APP_TITLE = _APP_TITLE or APP_TITLE
+    OPENAI_MODEL_DEFAULT = _OPENAI_MODEL or OPENAI_MODEL_DEFAULT
+    OPENAI_API_KEY = _OPENAI_API_KEY or OPENAI_API_KEY
+    ADMIN_USER = _ADMIN_USER or ADMIN_USER
+    ADMIN_PASSWORD = _ADMIN_PASSWORD or ADMIN_PASSWORD
+    MAX_TOKENS_PER_REQUEST = int(_MAX_TOKENS or MAX_TOKENS_PER_REQUEST)
+except Exception:
+    pass
 
-client = create_client(OPENAI_API_KEY)
+# secrets/env fallback
+OPENAI_API_KEY = OPENAI_API_KEY or st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
-def _to_float(x):
-    try:
-        if isinstance(x, str):
-            x = x.replace('.', '').replace(',', '.').replace('€','').replace('$','').strip()
-        return float(x)
-    except Exception:
-        return None
-
-def _curr_symbol(c):
-    if not c: return ""
-    c = str(c).upper()
-    return {"EUR":"€","USD":"$","GBP":"£","MXN":"$","COP":"$","CLP":"$","ARS":"$","BRL":"R$"}.get(c, c)
-
-def fmt_money(value, currency="EUR"):
-    v = _to_float(value)
-    if v is None: return "—"
-    s = _curr_symbol(currency)
-    return f"{v:,.2f} {s}".replace(",", "_").replace(".", ",").replace("_", ".")
-
-def render_extra_fields(title: str, data: dict, used_keys: set):
-    if not isinstance(data, dict): 
-        return
-    extra = {k:v for k,v in data.items() if k not in used_keys and v not in (None, "", [], {})}
-    if not extra:
-        return
-    with st.expander(title, expanded=False):
-        for k, v in extra.items():
-            header = k.replace("_"," ").capitalize()
-            if isinstance(v, list):
-                if v and isinstance(v[0], dict):
-                    try:
-                        import pandas as pd
-                        st.dataframe(pd.DataFrame(v), use_container_width=True, hide_index=True)
-                    except Exception:
-                        for it in v:
-                            st.markdown(f"- {it}")
-                else:
-                    for it in v:
-                        st.markdown(f"- {it}")
-            elif isinstance(v, dict):
-                try:
-                    import pandas as pd
-                    st.dataframe(pd.DataFrame([v]), use_container_width=True, hide_index=True)
-                except Exception:
-                    st.markdown("; ".join(f"**{a}:** {b}" for a,b in v.items()))
-            else:
-                st.markdown(f"**{header}:** {v}")
-
-
+# Página (temprano)
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
-def login():
-    admin_user = os.getenv("ADMIN_USER", "admin")
-    admin_pass = os.getenv("ADMIN_PASSWORD", "rfpanalyzer")
-    if st.session_state.get("auth"): return
+# -----------------------------------------------------------------------------------
+# OpenAI SDK (v1.x)
+# -----------------------------------------------------------------------------------
+if not OPENAI_API_KEY:
+    st.error("No se encontró OPENAI_API_KEY. Configura `st.secrets` o variable de entorno.")
+    st.stop()
+
+try:
+    from openai import OpenAI, BadRequestError
+except Exception as e:
+    st.error(f"No se pudo importar `openai`: {e}")
+    st.stop()
+
+_oai = OpenAI(api_key=OPENAI_API_KEY)
+
+# -----------------------------------------------------------------------------------
+# PDF parsing: intenta services.pdf_loader; si no, fallback PyPDF2
+# -----------------------------------------------------------------------------------
+def _fallback_extract_pdf_text(file_like: io.BytesIO) -> Tuple[List[str], str]:
+    try:
+        from PyPDF2 import PdfReader  # type: ignore
+        reader = PdfReader(file_like)
+        pages = []
+        for page in reader.pages:
+            try:
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            pages.append(t)
+        return pages, "\n".join(pages)
+    except Exception as e:
+        raise RuntimeError(f"Fallo al parsear PDF (fallback): {e}")
+
+try:
+    from services.pdf_loader import extract_pdf_text as _svc_extract_pdf_text  # type: ignore
+    def extract_pdf_text(file_like: io.BytesIO) -> Tuple[List[str], str]:
+        return _svc_extract_pdf_text(file_like)
+except Exception:
+    def extract_pdf_text(file_like: io.BytesIO) -> Tuple[List[str], str]:
+        return _fallback_extract_pdf_text(file_like)
+
+def clean_text(s: str) -> str:
+    s = s.replace("\x00", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\r?\n\s*\r?\n", "\n\n", s)
+    return s.strip()
+
+# -----------------------------------------------------------------------------------
+# Parámetros app
+# -----------------------------------------------------------------------------------
+AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini"]
+LOCAL_CONTEXT_MAX_CHARS = 40_000  # por sección (fallback local)
+
+# -----------------------------------------------------------------------------------
+# Login
+# -----------------------------------------------------------------------------------
+def login_gate():
+    if st.session_state.get("is_auth", False):
+        with st.sidebar:
+            if st.button("Cerrar sesión"):
+                st.session_state.clear()
+                st.rerun()
+        return
     st.title("Acceso")
-    with st.form("login"):
+    with st.form("login_form"):
         u = st.text_input("Usuario")
         p = st.text_input("Contraseña", type="password")
         ok = st.form_submit_button("Entrar")
         if ok:
-            if u == admin_user and p == admin_pass:
-                st.session_state["auth"] = True
+            if u == ADMIN_USER and p == ADMIN_PASSWORD:
+                st.session_state["is_auth"] = True
                 st.success("Acceso concedido.")
+                st.rerun()
             else:
                 st.error("Credenciales inválidas.")
     st.stop()
 
-def strip_code_fences(s: str) -> str:
+# -----------------------------------------------------------------------------------
+# Prompts “excelentes”: SYSTEM + SECCIONES
+# -----------------------------------------------------------------------------------
+SYSTEM_PREFIX = (
+  "Eres analista sénior de licitaciones en España y consultor TI."
+  " Respondes EXCLUSIVAMENTE con JSON VÁLIDO (UTF-8) y NADA MÁS."
+  " Si una clave no aplica o no hay evidencia, devuélvela igualmente con valor null o []."
+  " NUNCA inventes; usa SOLO información de los PDFs."
+  " Normaliza números decimales con punto y moneda explícita (p. ej., EUR)."
+  " Números sin separador de miles. Citas ≤ 180 caracteres."
+  " Incluye referencias de página como enteros únicos en orden ascendente cuando existan."
+  " Si hay versiones alternativas de un dato, usa 'discrepancias' para explicarlo brevemente."
+  " Optimiza por: precisión factual > concisión > completitud."
+)
+
+SECTION_SPECS: Dict[str, Dict[str, str]] = {
+  "objetivos_contexto": {
+    "titulo": "Objetivos y contexto",
+    "user_prompt": (
+      "Extrae objetivos y contexto del pliego. Devuelve SIEMPRE las claves listadas."
+      "\nSalida JSON EXACTA con claves:\n"
+      "{"
+      '  "resumen_servicios": str|null,'
+      '  "objetivos": [str],'
+      '  "alcance": str|null,'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: no inventes; si no hay dato, usa null/[]."
+    ),
+  },
+  "servicios": {
+    "titulo": "Servicios solicitados (detalle)",
+    "user_prompt": (
+      "Lista servicios solicitados y detalles (entregables, SLAs/KPIs, etc.). Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "resumen_servicios": str|null,'
+      '  "servicios_detalle": ['
+      '    {'
+      '      "nombre": str,'
+      '      "descripcion": str|null,'
+      '      "entregables": [str],'
+      '      "requisitos": [str],'
+      '      "periodicidad": str|null,'
+      '      "volumen": str|null,'
+      '      "ubicacion_modalidad": str|null,'
+      '      "sla_kpi": [{"nombre": str, "objetivo": str|null, "unidad": str|null, "metodo_medicion": str|null}],'
+      '      "criterios_aceptacion": [str]'
+      '    }'
+      '  ],'
+      '  "alcance": str|null,'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: deduplica; no inventes; null/[] si no hay."
+    ),
+  },
+  "importe": {
+    "titulo": "Importe de licitación",
+    "user_prompt": (
+      "Extrae importes y condiciones (IVA, anualidades/prórrogas). Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "importe_total": float|null,'
+      '  "moneda": str|null,'
+      '  "iva_incluido": bool|null,'
+      '  "tipo_iva": float|null,'
+      '  "importes_detalle": ['
+      '    {"concepto": str|null, "importe": float|null, "moneda": str|null, "observaciones": str|null,'
+      '     "periodo": {"tipo": "anualidad"|"prorroga"|null, "anyo": int|null, "duracion_meses": int|null}}'
+      '  ],'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: números con punto; si hay varias cifras, recoge todas en importes_detalle y usa discrepancias."
+    ),
+  },
+  "criterios_valoracion": {
+    "titulo": "Criterios de valoración",
+    "user_prompt": (
+      "Extrae criterios/subcriterios con pesos, tipo, umbrales, método y desempates. Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "criterios_valoracion": ['
+      '    {'
+      '      "nombre": str,'
+      '      "peso_max": float|null,'
+      '      "tipo": "puntos"|"porcentaje"|null,'
+      '      "umbral_minimo": float|null,'
+      '      "metodo_evaluacion": str|null,'
+      '      "subcriterios": ['
+      '        {"nombre": str, "peso_max": float|null, "tipo": "puntos"|"porcentaje"|null, "observaciones": str|null}'
+      '      ]'
+      '    }'
+      '  ],'
+      '  "criterios_desempate": [str],'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: conserva jerarquía; null/[] si no hay."
+    ),
+  },
+  "indice_tecnico": {
+    "titulo": "Índice de la respuesta técnica",
+    "user_prompt": (
+      # *** Prompt reforzado según tu enunciado ***
+      "1) Analiza en detalle la propuesta e identifica, si existe, el índice solicitado literal para la respuesta técnica. "
+      "2) Si no existiera, propón en base al pliego un índice alineado (implementable), que contenga al menos: contexto, "
+      "nuestro enfoque, metodología, alcance y actividades, planificación con hitos, equipo y roles, governance, gestión de calidad y SLAs, "
+      "gestión de riesgos/continuidad, ciberseguridad/compliance, sostenibilidad/accesibilidad y anexos. "
+      "El índice propuesto NO debe ir vacío y debe ser accionable (con subapartados)."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "indice_respuesta_tecnica": ['
+      '    {"titulo": str, "descripcion": str|null, "subapartados": [str]}'
+      '  ],'
+      '  "indice_propuesto": ['
+      '    {"titulo": str, "descripcion": str|null, "subapartados": [str]}'
+      '  ],'
+      '  "trazabilidad": [{"propuesto": str, "solicitado_match": str|null}],'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: si no hay índice literal, 'indice_respuesta_tecnica' puede ir [], pero 'indice_propuesto' DEBE incluir >=10 apartados con subapartados clave."
+    ),
+  },
+  "riesgos_exclusiones": {
+    "titulo": "Riesgos y exclusiones",
+    "user_prompt": (
+      "Identifica riesgos y exclusiones del pliego. Si no hay lista explícita, sintetiza riesgos compatibles con lo definido."
+      " Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "riesgos_y_dudas": str|null,'
+      '  "exclusiones": [str],'
+      '  "matriz_riesgos": ['
+      '    {"riesgo": str, "probabilidad_1_5": int|null, "impacto_1_5": int|null,'
+      '     "criticidad_1_25": int|null, "mitigacion": str|null, "responsable": str|null}'
+      '  ],'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: no inventes fuera del pliego; si infieres, debe ser coherente con lo que SÍ aparece."
+    ),
+  },
+  "solvencia": {
+    "titulo": "Criterios de solvencia",
+    "user_prompt": (
+      "Extrae solvencia técnica, económica y administrativa y cómo se acredita. Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "solvencia": {'
+      '    "tecnica": [str],'
+      '    "economica": [str],'
+      '    "administrativa": [str],'
+      '    "acreditacion": [{"requisito": str, "documento_necesario": str|null, "norma_referencia": str|null, "umbral": str|null}]'
+      '  },'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: una condición por bullet; null/[] si no hay."
+    ),
+  },
+  "formato_oferta": {
+    "titulo": "Formato y entrega de la oferta",
+    "user_prompt": (
+      "Extrae requisitos de formato y entrega de la oferta (memoria técnica/administrativa): extensión máxima, tamaño de fuente, "
+      "tipografía, interlineado, márgenes, estructura documental requerida, idioma, número de copias, formatos de archivo, tamaño máximo, "
+      "firma digital y quién firma, paginación/numeración, etiquetado de sobres/archivos, canal de entrega (plataforma/sobre electrónico), "
+      "plazo/fecha/hora y zona horaria, instrucciones de presentación y anexos obligatorios. Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "formato_esperado": str|null,'
+      '  "longitud_paginas": int|null,'
+      '  "tipografia": {"familia": str|null, "tamano_min": float|null, "interlineado": float|null, "margenes": str|null},'
+      '  "estructura_documental": [ {"titulo": str, "observaciones": str|null} ],'
+      '  "requisitos_presentacion": [str],'
+      '  "requisitos_archivo": {'
+      '     "formatos_permitidos": [str],'
+      '     "tamano_max_mb": float|null,'
+      '     "firma_digital_requerida": bool|null,'
+      '     "firmado_por": str|null'
+      '  },'
+      '  "idioma": str|null,'
+      '  "copias": int|null,'
+      '  "entrega": {'
+      '     "canal": str|null,'
+      '     "plazo": str|null,'
+      '     "zona_horaria": str|null,'
+      '     "instrucciones": [str]'
+      '  },'
+      '  "paginacion": {"requerida": bool|null, "formato": str|null},'
+      '  "etiquetado": [str],'
+      '  "anexos_obligatorios": [str],'
+      '  "confidencialidad": str|null,'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: no inventes; null/[] si no hay; convierte longitudes numéricas cuando sea posible."
+    ),
+  },
+}
+
+# -----------------------------------------------------------------------------------
+# Palabras clave para selección local (recall)
+# -----------------------------------------------------------------------------------
+SECTION_KEYWORDS = {
+  "objetivos_contexto": {"objeto del contrato": 5, "objeto": 3, "alcance": 4, "objetivo": 3,
+                         "contexto": 3, "descripción del servicio": 4, "alcances": 3},
+  "servicios": {"servicios": 5, "actividades": 4, "tareas": 4, "entregables": 4,
+                "nivel de servicio": 4, "sla": 3, "kpi": 3, "periodicidad": 3, "volumen": 3},
+  "importe": {"presupuesto base": 6, "importe": 5, "precio": 4, "iva": 4,
+              "base imponible": 4, "prórroga": 4, "anualidad": 4, "licitación": 4},
+  "criterios_valoracion": {"criterios de valoración": 6, "criterios de adjudicación": 6,
+                           "baremo": 5, "puntuación": 5, "puntos": 4, "porcentaje": 4,
+                           "peso": 4, "umbral": 4, "desempate": 4, "fórmula": 4},
+  "indice_tecnico": {"índice": 6, "indice": 6, "estructura": 5, "estructura mínima": 6,
+                     "contenido de la oferta": 6, "contenido mínimo": 6, "memoria técnica": 5,
+                     "documentación técnica": 5, "apartados": 4, "secciones": 4,
+                     "instrucciones de preparación": 5, "formato de la propuesta": 5,
+                     "orden de contenidos": 5, "capítulos": 4, "anexos": 3,
+                     "presentación de ofertas": 4, "sobre técnico": 5},
+  "riesgos_exclusiones": {"exclusiones": 7, "no incluye": 7, "quedan excluidos": 7,
+                          "no serán objeto": 6, "limitaciones": 5, "incompatibilidades": 5,
+                          "responsabilidad": 4, "exenciones": 4, "penalizaciones": 5,
+                          "causas de exclusión": 6, "supuestos de exclusión": 6,
+                          "condiciones especiales": 4, "garantías": 4, "plazos": 4,
+                          "régimen sancionador": 5, "riesgos": 4, "restricciones": 4},
+  "solvencia": {"solvencia técnica": 6, "solvencia económica": 6, "solvencia financiera": 5,
+                "requisitos de solvencia": 6, "clasificación": 4, "experiencia": 4,
+                "medios personales": 4, "medios materiales": 4, "acreditación": 5},
+  "formato_oferta": {"formato": 6, "formato de la oferta": 7, "formato de la propuesta": 6,
+                     "presentación de ofertas": 7, "presentacion de ofertas": 7, "presentación": 5,
+                     "memoria técnica": 6, "longitud": 6, "páginas": 6, "paginas": 6, "extensión": 6, "extension": 6,
+                     "tamaño de letra": 6, "tamano de letra": 6, "tipografía": 5, "tipografia": 5,
+                     "interlineado": 5, "márgenes": 5, "margenes": 5, "fuente": 5, "tipo de letra": 5,
+                     "etiquetado": 5, "rotulación": 5, "rotulacion": 5, "sobres": 6, "sobre electrónico": 6,
+                     "plataforma": 6, "perfil del contratante": 5, "archivo pdf": 6, "pdf": 5, "docx": 4,
+                     "firma electrónica": 6, "firma digital": 6, "firmado": 5,
+                     "idioma": 5, "copia": 5, "copias": 5, "paginación": 5, "numeración": 5,
+                     "fecha de entrega": 6, "plazo de presentación": 6, "hora": 5, "zona horaria": 4},
+}
+
+SECTION_CONTEXT_TUNING = {
+    "indice_tecnico": {"max_chars": 80_000, "window": 2},
+    "riesgos_exclusiones": {"max_chars": 60_000, "window": 2},
+    "formato_oferta": {"max_chars": 60_000, "window": 2},
+}
+
+# -----------------------------------------------------------------------------------
+# Utilidades OpenAI (Responses) + robustez
+# -----------------------------------------------------------------------------------
+def _strip_code_fences(s: str) -> str:
     s = s.strip()
-    s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.I)
+    s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\s*```\s*$', '', s)
     return s
 
-def extract_json_block(s: str) -> str:
+def _extract_json_block(s: str) -> str:
     m = re.search(r"\{[\s\S]*\}", s)
-    if not m: raise RuntimeError("Sin JSON parseable.")
+    if not m:
+        raise RuntimeError("La respuesta del modelo no contiene JSON parseable.")
     return m.group(0)
 
-def loads_robust(raw):
-    if raw is None: raise RuntimeError("Vacío")
-    if not isinstance(raw, str): return raw
-    s = strip_code_fences(raw)
+def _json_loads_robust(raw: Any) -> Any:
+    if raw is None:
+        raise RuntimeError("Respuesta vacía del modelo.")
+    if not isinstance(raw, str):
+        return raw
+    s = _strip_code_fences(raw)
+    if not s:
+        raise RuntimeError("Cadena vacía tras limpiar cercas de código.")
     try:
         return json.loads(s)
     except json.JSONDecodeError:
-        return json.loads(extract_json_block(s))
+        return json.loads(_extract_json_block(s))
 
-def score_page(text: str, weights: dict) -> int:
-    if not text: return 0
-    t = text.lower()
-    return sum(t.count(k)*w for k, w in weights.items())
+def _coalesce_text_from_responses(rsp) -> Optional[str]:
+    txt = getattr(rsp, "output_text", None)
+    if txt:
+        return txt
+    out = getattr(rsp, "output", None)
+    if out:
+        parts = []
+        for item in out:
+            content = getattr(item, "content", None)
+            if isinstance(content, list):
+                for block in content:
+                    val = getattr(block, "text", None)
+                    if val:
+                        parts.append(val)
+                    elif isinstance(block, dict):
+                        v = block.get("text") or block.get("value")
+                        if v:
+                            parts.append(v)
+        if parts:
+            return "\n".join(parts)
+    msg = getattr(rsp, "message", None)
+    if msg and isinstance(getattr(msg, "content", None), list):
+        parts = []
+        for block in msg.content:
+            val = getattr(block, "text", None)
+            if val:
+                parts.append(val)
+            elif isinstance(block, dict):
+                v = block.get("text") or block.get("value")
+                if v:
+                    parts.append(v)
+        if parts:
+            return "\n".join(parts)
+    return None
 
-def select_relevant_spans(pages: List[str], section_key: str, max_chars: int = LOCAL_CONTEXT_MAX_CHARS, window: int = 1) -> str:
-    tune = SECTION_CONTEXT_TUNING.get(section_key, {})
-    max_chars = tune.get("max_chars", max_chars)
-    window = tune.get("window", window)
+def _is_temperature_error(e: Exception) -> bool:
+    s = str(e)
+    return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
 
-    weights = SECTION_KEYWORDS.get(section_key, {})
-    scored = [(score_page(p, weights), i) for i, p in enumerate(pages)]
-    scored.sort(reverse=True)
+def _is_unsupported_param(e: Exception, param: str) -> bool:
+    s = str(e)
+    return (("unsupported_parameter" in s or "Unknown parameter" in s or "unexpected keyword" in s) and (param in s))
 
-    used, total, selected = set(), 0, []
-    for sc, i in scored:
-        if sc <= 0: break
-        for j in range(max(0, i-window), min(len(pages), i+window+1)):
-            if j in used: continue
-            txt = pages[j]
-            if not txt: continue
-            if total + len(txt) > max_chars: break
-            selected.append(f"[Pág {j+1}]\n{txt}")
-            used.add(j)
-            total += len(txt)
-        if total >= max_chars: break
+def _responses_create_robust(args: dict):
+    a = dict(args)
+    for _ in range(5):
+        try:
+            return _oai.responses.create(**a)
+        except (BadRequestError, TypeError) as e:
+            s = str(e)
+            if _is_temperature_error(e) or ("temperature" in s and "unexpected" in s.lower()):
+                a.pop("temperature", None); continue
+            if _is_unsupported_param(e, "response_format"):
+                a.pop("response_format", None); continue
+            if _is_unsupported_param(e, "max_output_tokens"):
+                val = a.pop("max_output_tokens", None)
+                if val is not None:
+                    a["max_completion_tokens"] = val
+                continue
+            raise
 
-    if not selected:
-        for j, txt in enumerate(pages[:2]):
-            if txt:
-                selected.append(f"[Pág {j+1}]\n{txt}")
-                total += len(txt)
-                if total >= max_chars: break
-
-    return "\n\n".join(selected)
-
-# ---------------------------
-# Logging
-# ---------------------------
-def _logs_init():
+# -----------------------------------------------------------------------------------
+# Logging de prompts/respuestas
+# -----------------------------------------------------------------------------------
+def _log_init():
+    # Asegurar que existen todas las claves (incluida formato_oferta)
     st.session_state.setdefault("logs", {})
     for k in SECTION_SPECS.keys():
         st.session_state["logs"].setdefault(k, [])
 
-def _log_event(section_key: str, model: str, temperature: float, prompt: str, response_text: str, mode: str):
-    _logs_init()
+def _log_event(section_key: str, fase: str, prompt: str, response_text: str, modelo: str):
+    _log_init()
     st.session_state["logs"][section_key].append({
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "model": model,
-        "temperature": temperature,
-        "mode": mode,  # "input_file" | "local_fallback"
+        "fase": fase,            # "input_file", "local_fallback", "synthesis", etc.
+        "model": modelo,
         "prompt": prompt,
         "response": response_text,
     })
 
-def file_input_call(user_prompt: str, model: str, temperature: float, file_ids: List[str], section_key: str):
+# -----------------------------------------------------------------------------------
+# Envío a OpenAI con PDFs como input_file (sin tools)
+# -----------------------------------------------------------------------------------
+def _file_input_section_call(
+    user_prompt: str,
+    model: str,
+    temperature: Optional[float],
+    file_ids: List[str],
+    section_key: Optional[str] = None,
+) -> Dict[str, Any]:
     sys_msg = {"role": "system", "content": [{"type": "input_text", "text": SYSTEM_PREFIX}]}
     content = [{"type": "input_text", "text": user_prompt}]
     for fid in file_ids:
         content.append({"type": "input_file", "file_id": fid})
     usr_msg = {"role": "user", "content": content}
 
-    # Log prompt
-    prompt_text = f"[SYSTEM]\n{SYSTEM_PREFIX}\n\n[USER]\n{user_prompt}\n\n[FILES]\n" + "\n".join(file_ids)
+    log_prompt = f"[SYSTEM]\n{SYSTEM_PREFIX}\n\n[USER]\n{user_prompt}\n\n[FILES]\n" + "\n".join(file_ids)
 
     args = dict(
         model=model,
@@ -186,30 +522,97 @@ def file_input_call(user_prompt: str, model: str, temperature: float, file_ids: 
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
         temperature=temperature,
     )
-    rsp = responses_create_robust(client, args)
-    txt = coalesce_text_from_responses(rsp) or json.dumps(rsp, default=str)
+    rsp = _responses_create_robust(args)
+    raw_text = _coalesce_text_from_responses(rsp) or json.dumps(rsp, default=str)
+    _log_event(section_key or "desconocida", "input_file", log_prompt, raw_text, model)
 
-    _log_event(section_key, model, temperature, prompt_text, (txt or "")[:200000], "input_file")
+    if not raw_text:
+        try:
+            raw_text = _extract_json_block(json.dumps(rsp, default=str))
+        except Exception:
+            return _force_jsonify_from_text(section_key, json.dumps(rsp, default=str), model, temperature)
 
-    return loads_robust(txt)
+    try:
+        return _json_loads_robust(raw_text)
+    except Exception:
+        return _force_jsonify_from_text(section_key, raw_text, model, temperature)
 
-def local_call(section_key: str, model: str, temperature: float, max_chars: int):
-    docs = st.session_state.get("local_docs", [])
+# -----------------------------------------------------------------------------------
+# Selección local de páginas relevantes (fallback)
+# -----------------------------------------------------------------------------------
+def _score_page(text: str, weights: dict) -> int:
+    if not text:
+        return 0
+    t = text.lower()
+    score = 0
+    for kw, w in weights.items():
+        score += t.count(kw) * w
+    return score
+
+def _select_relevant_spans(pages: List[str], section_key: str,
+                           max_chars: int = LOCAL_CONTEXT_MAX_CHARS, window: int = 1) -> str:
+    tune = SECTION_CONTEXT_TUNING.get(section_key, {})
+    max_chars = tune.get("max_chars", max_chars)
+    window = tune.get("window", window)
+
+    weights = SECTION_KEYWORDS.get(section_key, {})
+    scored = [(_score_page(p, weights), i) for i, p in enumerate(pages)]
+    scored.sort(reverse=True)
+
+    used, total, selected = set(), 0, []
+    for sc, i in scored:
+        if sc <= 0:
+            break
+        for j in range(max(0, i - window), min(len(pages), i + window + 1)):
+            if j in used:
+                continue
+            txt = pages[j]
+            if not txt:
+                continue
+            if total + len(txt) > max_chars:
+                break
+            selected.append(f"[Pág {j+1}]\n{txt}")
+            used.add(j)
+            total += len(txt)
+        if total >= max_chars:
+            break
+
+    if not selected:
+        for j, txt in enumerate(pages[:2]):
+            if txt:
+                selected.append(f"[Pág {j+1}]\n{txt}")
+                total += len(txt)
+                if total >= max_chars:
+                    break
+
+    return "\n\n".join(selected)
+
+def _local_singlecall_section(section_key: str, model: str, temperature: float, max_chars: int):
+    docs = st.session_state.get("fs_local_docs", [])
+    if not docs:
+        raise RuntimeError("No hay texto local para fallback.")
+
     contexts = []
     for d in docs:
-        sel = select_relevant_spans(d["pages"], section_key, max_chars=max_chars)
-        if sel: contexts.append(sel)
-    context = "\n\n".join(contexts)[:120000]
+        sel = _select_relevant_spans(d["pages"], section_key, max_chars=max_chars)
+        if sel:
+            contexts.append(sel)
+    context = "\n\n".join(contexts)[:120_000]
 
+    sys_msg = {"role": "system", "content": [{"type": "input_text", "text": (
+        "Eres un analista sénior de licitaciones y consultor de TI. "
+        "Responde SOLO con JSON válido. Nunca inventes; null/[] si falta información."
+    )}]}
     schema_hint = SECTION_SPECS[section_key]["user_prompt"]
-    sys_msg = {"role": "system", "content": [{"type": "input_text", "text": "Responde SOLO con JSON válido."}]}
-    usr_text = (
-        "Extrae la sección solicitada según el siguiente esquema (JSON). "
-        "Usa EXCLUSIVAMENTE el contexto que sigue.\n\n[ESQUEMA]\n"
-        f"{schema_hint}\n\n[CONTEXTO]\n<<<\n{context}\n>>>\n"
-        "Responde solo con JSON válido."
-    )
-    usr_msg = {"role": "user", "content": [{"type": "input_text", "text": usr_text}]}
+    usr_msg = {"role": "user", "content": [{
+        "type": "input_text",
+        "text": (
+            "Extrae la sección solicitada según el siguiente esquema (JSON). "
+            "Usa EXCLUSIVAMENTE el contexto que sigue.\n\n[ESQUEMA]\n"
+            f"{schema_hint}\n\n[CONTEXTO]\n<<<\n{context}\n>>>\n"
+            "Responde solo con JSON válido."
+        )
+    }]}
 
     args = dict(
         model=model,
@@ -218,129 +621,295 @@ def local_call(section_key: str, model: str, temperature: float, max_chars: int)
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
         temperature=temperature,
     )
-    rsp = responses_create_robust(client, args)
-    txt = coalesce_text_from_responses(rsp) or json.dumps(rsp, default=str)
+    rsp = _responses_create_robust(args)
+    text = _coalesce_text_from_responses(rsp) or _extract_json_block(json.dumps(rsp, default=str))
+    _log_event(section_key, "local_fallback", schema_hint + "\n\n[CONTEXTO]\n<<<…>>>", text, model)
+    return _json_loads_robust(text)
 
-    _log_event(section_key, model, temperature, usr_text, (txt or "")[:200000], "local_fallback")
+def _synthesis_fill_section(section_key: str, model: str, temperature: float):
+    """Síntesis garantizada para índice técnico / riesgos si no hay literal claro."""
+    docs = st.session_state.get("fs_local_docs", [])
+    if not docs:
+        return None
 
-    return loads_robust(txt)
+    snippets = []
+    for d in docs:
+        pages = d["pages"]
+        head = "\n\n".join([f"[Pág {i+1}]\n{p}" for i, p in enumerate(pages[:2]) if p])
+        kw = "indice_tecnico" if section_key == "indice_tecnico" else "riesgos_exclusiones"
+        tail = _select_relevant_spans(pages, kw, max_chars=60_000, window=2)
+        combined = "\n\n".join([head, tail]).strip()
+        if combined:
+            snippets.append(combined)
+    context = "\n\n---\n\n".join(snippets)[:140_000]
 
-def main():
-    login()
-    st.title(APP_TITLE)
-    with st.sidebar:
-        model = st.selectbox("Modelo OpenAI", AVAILABLE_MODELS, index=0)
-        temperature = st.slider(
-            "Temperatura", 0.0, 1.0, DEFAULT_TEMPERATURE, 0.05,
-            help=("Baja=determinista; Alta=creativa. Para pliegos, 0.1–0.3 recomendado.")
+    if section_key == "indice_tecnico":
+        instruction = (
+            "No hay índice literal claro. Constrúyelo a partir de objetivos, alcance, servicios y criterios del pliego. "
+            "Devuelve SOLO JSON con claves obligatorias: 'indice_respuesta_tecnica' (puede ir []), "
+            "'indice_propuesto' (NO vacío con >=10 apartados y subapartados), 'trazabilidad' (opcional), "
+            "'referencias_paginas', 'evidencias', 'discrepancias'."
         )
+        schema_hint = SECTION_SPECS["indice_tecnico"]["user_prompt"]
+    else:
+        instruction = (
+            "Si el pliego no enumera riesgos/exclusiones, sintetiza riesgos plausibles basados EXCLUSIVAMENTE en el contenido del pliego "
+            "(objetivos/alcance/servicios/criterios/condiciones). Devuelve SOLO JSON con "
+            "'riesgos_y_dudas' (no vacío), 'exclusiones' si hay, 'matriz_riesgos' con PxI y mitigación si deducible, "
+            "'referencias_paginas' y 'evidencias' si existen, 'discrepancias' si detectas incoherencias."
+        )
+        schema_hint = SECTION_SPECS["riesgos_exclusiones"]["user_prompt"]
 
-    _logs_init()
+    sys_msg = {"role": "system", "content": [{"type": "input_text", "text": "Responde SOLO con JSON válido."}]}
+    usr_msg = {"role": "user", "content": [{
+        "type": "input_text",
+        "text": f"{instruction}\n\n[ESQUEMA]\n{schema_hint}\n\n[CONTEXTO]\n<<<\n{context}\n>>>\n"
+    }]}
 
-    files = st.file_uploader("Sube PDF(s)", type=["pdf"], accept_multiple_files=True)
+    args = dict(
+        model=model,
+        input=[sys_msg, usr_msg],
+        response_format={"type": "json_object"},
+        max_output_tokens=MAX_TOKENS_PER_REQUEST,
+        temperature=temperature,
+    )
+    rsp = _responses_create_robust(args)
+    text = _coalesce_text_from_responses(rsp) or _extract_json_block(json.dumps(rsp, default=str))
+    _log_event(section_key, "synthesis", schema_hint + "\n\n[CONTEXTO]\n<<<…>>>", text, model)
+    return _json_loads_robust(text)
 
-    # Botón recargar ficheros (re-subir a OpenAI y reparsear local)
-    recargar = st.button("♻️ Recargar ficheros en OpenAI", help="Vuelve a subir los PDF y reinicia el análisis.")
-    if recargar and not files:
-        st.warning("Selecciona los PDF antes de recargar.")
-    if (recargar and files) or ("file_ids" not in st.session_state and files):
-        with st.spinner("Subiendo PDFs a OpenAI y extrayendo texto…"):
-            fids, local_docs = [], []
-            for f in files:
-                content = f.read()
-                up = client.files.create(file=(f.name, content, "application/pdf"), purpose="assistants")
-                fids.append(up.id)
-                pages, _ = extract_pdf_text(io.BytesIO(content))
-                local_docs.append({"name": f.name, "pages": [clean_text(p) for p in pages]})
-            st.session_state["file_ids"] = fids
-            st.session_state["local_docs"] = local_docs
-            # Reinicia resultados al recargar
-            st.session_state["sections"] = {}
-            # Limpia logs según petición del usuario
-            st.session_state["logs"] = {}
-        st.success("Ficheros listos.")
-    if "file_ids" not in st.session_state:
-        st.stop()
+# -----------------------------------------------------------------------------------
+# Detección de “resultado vacío”
+# -----------------------------------------------------------------------------------
+REQUIRED_NONEMPTY = {
+    "objetivos_contexto": ["resumen_servicios", "objetivos", "alcance"],
+    "servicios": ["servicios_detalle", "resumen_servicios"],
+    "importe": ["importe_total", "importes_detalle"],
+    "criterios_valoracion": ["criterios_valoracion"],
+    "indice_tecnico": ["indice_propuesto"],
+    "riesgos_exclusiones": ["riesgos_y_dudas", "exclusiones", "matriz_riesgos"],
+    "solvencia": ["solvencia"],
+    "formato_oferta": ["formato_esperado", "requisitos_presentacion", "requisitos_archivo", "estructura_documental"],
+}
 
-    tabs = st.tabs(["Análisis", "Logs"])
-    with tabs[0]:
-        st.subheader("Ejecutar análisis")
-        cols = st.columns(4)
-        btns = {
-            "objetivos_contexto": cols[0].button("Objetivos y contexto", use_container_width=True),
-            "servicios": cols[1].button("Servicios", use_container_width=True),
-            "importe": cols[2].button("Importe", use_container_width=True),
-            "criterios_valoracion": cols[3].button("Criterios de valoración", use_container_width=True),
-        }
-        cols2 = st.columns(4)
-        btns.update({
-            "indice_tecnico": cols2[0].button("Índice técnico", use_container_width=True),
-            "riesgos_exclusiones": cols2[1].button("Riesgos y exclusiones", use_container_width=True),
-            "solvencia": cols2[2].button("Solvencia", use_container_width=True),
-            "formato_oferta": cols2[3].button("Formato/Entrega", use_container_width=True),
-        })
-        all_btn = st.button("🔎 Análisis completo", type="primary", use_container_width=True)
+def _is_effectively_empty(section_key: str, data: Dict[str, Any]) -> bool:
+    if not isinstance(data, dict) or not data:
+        return True
+    keys = REQUIRED_NONEMPTY.get(section_key, [])
+    for k in keys:
+        v = data.get(k)
+        if isinstance(v, str) and v.strip():
+            return False
+        if isinstance(v, (int, float)) and v is not None:
+            return False
+        if isinstance(v, (list, dict)) and len(v) > 0:
+            return False
+    return True
 
-        st.session_state.setdefault("sections", {})
-        file_ids = st.session_state["file_ids"]
+def _dedupe_sorted_pages(pages: List[int]) -> List[int]:
+    try:
+        return sorted(set(int(p) for p in pages if p is not None))
+    except Exception:
+        return pages or []
 
-        def run_one(k: str, show_spinner: bool = True):
-            spec = SECTION_SPECS[k]
-            if show_spinner:
-                with st.spinner(f"Analizando: {spec['titulo']}…"):
-                    try:
-                        data = file_input_call(SECTION_SPECS[k]["user_prompt"], model, temperature, file_ids, k)
-                    except Exception:
-                        data = local_call(k, model, temperature, LOCAL_CONTEXT_MAX_CHARS)
-            else:
-                try:
-                    data = file_input_call(SECTION_SPECS[k]["user_prompt"], model, temperature, file_ids, k)
-                except Exception:
-                    data = local_call(k, model, temperature, LOCAL_CONTEXT_MAX_CHARS)
-            st.session_state["sections"][k] = data
+# -----------------------------------------------------------------------------------
+# Forzar JSON si el modelo devolvió texto no parseable
+# -----------------------------------------------------------------------------------
+def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: str, temperature: Optional[float]):
+    schema_hint = ""
+    if section_key and section_key in SECTION_SPECS:
+        schema_hint = SECTION_SPECS[section_key]["user_prompt"]
+    sys_msg = {"role": "system", "content": [{"type": "input_text", "text": "Devuelve SOLO un JSON válido (UTF-8)."}]}
+    usr_msg = {"role": "user", "content": [{
+        "type": "input_text",
+        "text": (
+            "Convierte estrictamente a JSON VÁLIDO que cumpla el esquema. "
+            "Usa null/[] si falta información.\n\n[ESQUEMA]\n"
+            f"{schema_hint}\n\n[RESPUESTA]\n<<<\n{raw_text}\n>>>\n"
+        ),
+    }]}
+    args = dict(
+        model=model,
+        input=[sys_msg, usr_msg],
+        response_format={"type": "json_object"},
+        max_output_tokens=MAX_TOKENS_PER_REQUEST,
+        temperature=temperature,
+    )
+    rsp = _responses_create_robust(args)
+    text = _coalesce_text_from_responses(rsp) or _extract_json_block(json.dumps(rsp, default=str))
+    _log_event(section_key or "desconocida", "jsonify", "[NORMALIZADOR JSON]", text, model)
+    return _json_loads_robust(text)
 
-        # Botones individuales
-        for k, pressed in btns.items():
-            if pressed:
-                run_one(k)
+# -----------------------------------------------------------------------------------
+# Ejecución de sección (PDF completo → local → síntesis)
+# -----------------------------------------------------------------------------------
+def run_section(section_key: str, model: str, temperature: float, max_chars: int, file_ids: List[str]) -> Tuple[Dict[str, Any], str]:
+    # 1) input_file
+    try:
+        data = _file_input_section_call(
+            user_prompt=SECTION_SPECS[section_key]["user_prompt"],
+            model=model,
+            temperature=temperature,
+            file_ids=file_ids,
+            section_key=section_key,
+        )
+        if _is_effectively_empty(section_key, data):
+            raise RuntimeError("input_file devolvió salida vacía para esta sección.")
+        if "referencias_paginas" in data:
+            data["referencias_paginas"] = _dedupe_sorted_pages(data.get("referencias_paginas") or [])
+        return data, "input_file"
+    except Exception:
+        # 2) Local
+        data = _local_singlecall_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
 
-        # Análisis completo
-        if all_btn:
-            keys = list(SECTION_SPECS.keys())
-            prog = st.progress(0.0, text="Ejecutando análisis completo…")
-            for i, k in enumerate(keys, start=1):
-                run_one(k, show_spinner=False)
-                prog.progress(i/len(keys), text=f"Ejecutando análisis completo… ({i}/{len(keys)})")
-            st.success("Análisis completo finalizado.")
+        # 3) Síntesis garantizada para índice/risks si sigue vacío
+        if section_key in {"indice_tecnico", "riesgos_exclusiones"} and _is_effectively_empty(section_key, data):
+            synth = _synthesis_fill_section(section_key, model=model, temperature=temperature)
+            if isinstance(synth, dict):
+                data = synth
 
-        
-fs_sections = st.session_state.get("sections", {})
-if fs_sections:
-    # Resumen ejecutivo (incluye duración del contrato y fecha máx. presentación)
-    resumen_ejecutivo(fs_sections)
+        # Semilla mínima si aún vacío (índice propuesto estándar)
+        if section_key == "indice_tecnico" and _is_effectively_empty(section_key, data):
+            data = {
+                "indice_respuesta_tecnica": [],
+                "indice_propuesto": [
+                    {"titulo": "Propuesta de valor", "descripcion": None, "subapartados": []},
+                    {"titulo": "Contexto y objetivos", "descripcion": None, "subapartados": []},
+                    {"titulo": "Alcance y supuestos", "descripcion": None, "subapartados": []},
+                    {"titulo": "Metodología y governance", "descripcion": None, "subapartados": []},
+                    {"titulo": "Plan de proyecto (hitos/plazos)", "descripcion": None, "subapartados": []},
+                    {"titulo": "Recursos y organización", "descripcion": None, "subapartados": []},
+                    {"titulo": "Gestión de calidad y SLAs", "descripcion": None, "subapartados": []},
+                    {"titulo": "Gestión de riesgos y continuidad", "descripcion": None, "subapartados": []},
+                    {"titulo": "Ciberseguridad y cumplimiento", "descripcion": None, "subapartados": []},
+                    {"titulo": "Sostenibilidad y accesibilidad", "descripcion": None, "subapartados": []},
+                    {"titulo": "Anexos", "descripcion": None, "subapartados": []},
+                ],
+                "trazabilidad": [],
+                "referencias_paginas": [],
+                "evidencias": [],
+                "discrepancias": ["Índice literal no hallado; se propone estructura estándar alineada al pliego."],
+            }
+
+        if "referencias_paginas" in data:
+            data["referencias_paginas"] = _dedupe_sorted_pages(data.get("referencias_paginas") or [])
+        return data, "local_single"
+
+# -----------------------------------------------------------------------------------
+# Cache de parseo PDF
+# -----------------------------------------------------------------------------------
+def _sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+@st.cache_data(show_spinner=False)
+def parse_pdf_cached(name: str, content_bytes: bytes) -> Dict[str, Any]:
+    pages, _ = extract_pdf_text(io.BytesIO(content_bytes))
+    pages = [clean_text(p) for p in pages]
+    total_chars = sum(len(p or "") for p in pages)
+    return {"name": name, "pages": pages, "total_chars": total_chars, "hash": _sha256(content_bytes)}
+
+# -----------------------------------------------------------------------------------
+# Sidebar (modelo + temperatura)
+# -----------------------------------------------------------------------------------
+def sidebar_config() -> Tuple[str, float]:
+    with st.sidebar:
+        st.header("Configuración")
+        if OPENAI_MODEL_DEFAULT in AVAILABLE_MODELS:
+            idx = AVAILABLE_MODELS.index(OPENAI_MODEL_DEFAULT)
+        else:
+            idx = 0
+        model = st.selectbox("Modelo OpenAI", AVAILABLE_MODELS, index=idx)
+        temperature = st.slider(
+            "Temperatura",
+            min_value=0.0, max_value=1.0, value=DEFAULT_TEMPERATURE, step=0.05,
+            help=(
+                "Controla la aleatoriedad de la salida.\n\n"
+                "- **Baja (0.0–0.3)**: más determinista/estable (recomendado para pliegos).\n"
+                "- **Media (0.4–0.7)**: equilibrio entre variedad y consistencia.\n"
+                "- **Alta (0.8–1.0)**: más creativa/variada, pero menos estable."
+            ),
+        )
+        st.caption("Para licitaciones, usar baja (≈0.1–0.3) mejora consistencia y pegado al texto.")
+    return model, float(temperature)
+
+# -----------------------------------------------------------------------------------
+# Render de resultados (UX – una sola vista, sin JSON visible)
+# -----------------------------------------------------------------------------------
+def _badge(text: str):
+    st.markdown(
+        f"<span style='display:inline-block;padding:2px 8px;border-radius:999px;"
+        f"background:#eef;border:1px solid #ccd;color:#334;font-size:12px'>{text}</span>",
+        unsafe_allow_html=True
+    )
+
+def _render_index_block(items: List[Dict[str, Any]]):
+    """Muestra título + descripción + subapartados (mejora UX índice técnico)."""
+    if not items:
+        st.info("Sin contenido.")
+        return
+    for i, s in enumerate(items, start=1):
+        titulo = s.get("titulo") or f"Sección {i}"
+        desc = s.get("descripcion")
+        subs = s.get("subapartados") or []
+        st.markdown(f"- **{titulo}**")
+        if desc:
+            st.caption(desc)
+        if subs:
+            st.write("\n".join([f"  • {x}" for x in subs]))
+
+def render_full_view(fs_sections: Dict[str, Any]):
+    oc = fs_sections.get("objetivos_contexto", {})
+    objetivos = oc.get("objetivos") or []
+    im = fs_sections.get("importe", {})
+    imp_total = im.get("importe_total")
+    moneda = im.get("moneda") or "EUR"
+    imp_str = f"{imp_total:.2f} {moneda}" if isinstance(imp_total, (int, float)) else "—"
+    sv = fs_sections.get("solvencia", {}).get("solvencia", {})
+    solv_tec = len(sv.get("tecnica", []))
+    solv_eco = len(sv.get("economica", []))
+    solv_adm = len(sv.get("administrativa", []))
+
+    st.markdown("### Resumen ejecutivo")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Importe total", imp_str)
+    c2.metric("Objetivos", len(objetivos))
+    c3.metric("Criterios solvencia (tot.)", solv_tec + solv_eco + solv_adm)
+    c4.metric("Secciones completas", sum(1 for k, v in fs_sections.items() if v))
+
     st.divider()
 
-    # =============== Objetivos y contexto ===============
-    oc = fs_sections.get("objetivos_contexto", {})
+    # Objetivos y contexto
     with st.expander("🎯 Objetivos y contexto", expanded=True):
-        st.markdown(f"**Resumen de servicios:** {oc.get('resumen_servicios') or '—'}")
-        if oc.get("objetivos"):
+        resumen = oc.get("resumen_servicios") or "—"
+        alcance = oc.get("alcance") or "—"
+        st.markdown(f"**Resumen de servicios:** {resumen}")
+        if objetivos:
             st.markdown("**Objetivos**:")
-            st.markdown(bullets(oc.get("objetivos") or []))
-        st.markdown(f"**Alcance:** {oc.get('alcance') or '—'}")
-        if oc.get('referencias_paginas'):
-            st.markdown("**Referencias de páginas:**")
-            st.markdown(bullets([str(x) for x in (oc.get('referencias_paginas') or [])]))
-        render_extra_fields("Detalles adicionales (objetivos/contexto)", oc, {'resumen_servicios','objetivos','alcance','referencias_paginas'})
+            st.write("\n".join([f"- {o}" for o in objetivos]))
+        st.markdown(f"**Alcance:** {alcance}")
+        evs = oc.get("evidencias") or []
+        disc = oc.get("discrepancias") or []
+        if evs or disc:
+            colA, colB = st.columns(2)
+            if evs:
+                with colA:
+                    st.caption("Evidencias")
+                    for e in evs[:4]:
+                        _badge(f"Pág {e.get('pagina')}")
+                        st.write(f"“{(e.get('cita') or '')[:180]}”")
+            if disc:
+                with colB:
+                    st.caption("Discrepancias")
+                    st.write("\n".join([f"- {d}" for d in disc]))
 
-    # =============== Servicios ===============
+    # Servicios
     svs = fs_sections.get("servicios", {})
-    with st.expander("🧩 Servicios solicitados (detalle)"):
+    with st.expander("🧩 Servicios solicitados (detalle)", expanded=False):
         st.markdown(f"**Resumen:** {svs.get('resumen_servicios') or '—'}")
         detalle = svs.get("servicios_detalle") or []
         if detalle:
             try:
-                import pandas as pd
+                import pandas as pd  # type: ignore
                 rows = []
                 for d in detalle:
                     rows.append({
@@ -355,59 +924,37 @@ if fs_sections:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             except Exception:
                 for d in detalle:
-                    st.markdown(f"- **{d.get('nombre')}** — {d.get('descripcion') or ''}")
+                    st.write(f"- **{d.get('nombre')}** — {d.get('descripcion') or ''}")
         else:
             st.info("Sin servicios detallados explícitos en el texto analizado.")
-        used = {"resumen_servicios","servicios_detalle","alcance","referencias_paginas"}
-        render_extra_fields("Detalles adicionales (servicios)", svs, used)
 
-    # =============== Importe ===============
-    im = fs_sections.get("importe", {})
-    with st.expander("💶 Importe de licitación"):
-        imp_total = im.get("importe_total")
-        moneda = im.get("moneda") or "EUR"
-        st.markdown(f"**Importe total:** {fmt_money(imp_total, moneda)}")
-        st.markdown(f"- **IVA incluido:** {im.get('iva_incluido') if im.get('iva_incluido') is not None else '—'}")
-        st.markdown(f"- **Tipo IVA:** {im.get('tipo_iva') if im.get('tipo_iva') is not None else '—'}")
-
+    # Importe
+    with st.expander("💶 Importe de licitación", expanded=False):
+        st.markdown(f"**Importe total:** {imp_str}")
+        iva_incl = im.get("iva_incluido")
+        tip_iva = im.get("tipo_iva")
+        st.write(f"- **IVA incluido:** {iva_incl if iva_incl is not None else '—'}")
+        st.write(f"- **Tipo IVA:** {tip_iva if tip_iva is not None else '—'}")
         det = im.get("importes_detalle") or []
         if det:
             try:
-                import pandas as pd
-                rows = []
-                for d in det:
-                    per = d.get("periodo") or {}
-                    rows.append({
-                        "Concepto": d.get("concepto"),
-                        "Importe": _to_float(d.get("importe")),
-                        "Importe (fmt)": fmt_money(d.get("importe"), d.get("moneda") or moneda),
-                        "Moneda": (d.get("moneda") or moneda),
-                        "Periodo": per.get("tipo"),
-                        "Año": per.get("anyo"),
-                        "Duración (meses)": per.get("duracion_meses"),
-                        "Observaciones": d.get("observaciones"),
-                    })
-                df = pd.DataFrame(rows)
-                if "Año" in df.columns and "Importe" in df.columns:
-                    tot = df.groupby("Año", dropna=False)["Importe"].sum().reset_index()
-                    tot["Total (fmt)"] = tot["Importe"].apply(lambda x: fmt_money(x, moneda))
-                    st.markdown("**Totales por año**")
-                    st.dataframe(tot[["Año","Total (fmt)"]], use_container_width=True, hide_index=True)
-                st.markdown("**Detalle de importes**")
-                st.dataframe(df.drop(columns=["Importe"], errors="ignore"), use_container_width=True, hide_index=True)
+                import pandas as pd  # type: ignore
+                st.dataframe(pd.DataFrame(det), use_container_width=True, hide_index=True)
             except Exception:
-                for d in det:
-                    st.markdown(f"- **{d.get('concepto')}** — {d}")
-        used = {"importe_total","moneda","iva_incluido","tipo_iva","importes_detalle"}
-        render_extra_fields("Detalles adicionales (importe)", im, used)
+                for x in det:
+                    st.write(f"- {x}")
+        disc = im.get("discrepancias") or []
+        if disc:
+            st.caption("Discrepancias")
+            st.write("\n".join([f"- {d}" for d in disc]))
 
-    # =============== Criterios de valoración ===============
+    # Criterios de valoración
     cv_all = fs_sections.get("criterios_valoracion", {})
-    with st.expander("📊 Criterios de valoración"):
-        cv = cv_all.get("criterios_valoracion") or []
+    cv = cv_all.get("criterios_valoracion") or []
+    with st.expander("📊 Criterios de valoración", expanded=False):
         if cv:
             try:
-                import pandas as pd
+                import pandas as pd  # type: ignore
                 rows = []
                 for c in cv:
                     rows.append({
@@ -421,122 +968,465 @@ if fs_sections:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             except Exception:
                 for c in cv:
-                    st.markdown(f"- {c.get('nombre')} (peso: {c.get('peso_max')} {c.get('tipo')})")
+                    st.write(f"- {c.get('nombre')} (peso: {c.get('peso_max')} {c.get('tipo')})")
             dmp = cv_all.get("criterios_desempate") or []
             if dmp:
                 st.markdown("**Criterios de desempate:**")
-                st.markdown(bullets(dmp))
+                st.write("\n".join([f"- {x}" for x in dmp]))
         else:
             st.info("No se encontraron criterios explícitos.")
-        used = {'criterios_valoracion','criterios_desempate'}
-        render_extra_fields('Detalles adicionales (criterios)', cv_all, used)
 
-    # =============== Índice técnico ===============
+    # Índice técnico (mejor render: título + descripción + subapartados)
     it = fs_sections.get("indice_tecnico", {})
-    with st.expander("🗂️ Índice de la respuesta técnica"):
+    with st.expander("🗂️ Índice de la respuesta técnica", expanded=False):
         col1, col2 = st.columns(2)
+        req = it.get("indice_respuesta_tecnica") or []
+        prop = it.get("indice_propuesto") or []
         with col1:
             st.markdown("**Índice solicitado (literal)**")
-            render_index(it.get("indice_respuesta_tecnica") or [])
+            _render_index_block(req)
         with col2:
             st.markdown("**Índice propuesto (accionable)**")
-            render_index(it.get("indice_propuesto") or [])
-        used = {'indice_respuesta_tecnica','indice_propuesto'}
-        render_extra_fields('Detalles adicionales (índice técnico)', it, used)
+            _render_index_block(prop)
+        tr = it.get("trazabilidad") or []
+        if tr:
+            st.caption("Trazabilidad propuesto → solicitado")
+            for t in tr[:12]:
+                st.write(f"- **{t.get('propuesto')}** → {t.get('solicitado_match') or '—'}")
+        disc = it.get("discrepancias") or []
+        if disc:
+            st.caption("Discrepancias")
+            st.write("\n".join([f"- {d}" for d in disc]))
 
-    # =============== Formato/entrega ===============
+    # Formato y entrega de la oferta
     fmt = fs_sections.get("formato_oferta", {})
-    with st.expander("🧾 Formato y entrega de la oferta"):
+    with st.expander("🧾 Formato y entrega de la oferta", expanded=False):
         st.markdown(f"**Formato esperado:** {fmt.get('formato_esperado') or '—'}")
         lp = fmt.get("longitud_paginas")
-        st.markdown(f"- **Longitud (pág.)**: {lp if isinstance(lp, (int, float)) else '—'}")
+        st.write(f"- **Longitud (pág.)**: {lp if isinstance(lp, (int, float)) else '—'}")
         tip = fmt.get("tipografia") or {}
-        st.markdown(f"- **Tipografía**: {tip.get('familia') or '—'} / **Tamaño mínimo**: {tip.get('tamano_min') or '—'} / "
+        st.write(f"- **Tipografía**: {tip.get('familia') or '—'} / **Tamaño mínimo**: {tip.get('tamano_min') or '—'} / "
                  f"**Interlineado**: {tip.get('interlineado') or '—'} / **Márgenes**: {tip.get('margenes') or '—'}")
         est = fmt.get("estructura_documental") or []
         if est:
             st.markdown("**Estructura documental requerida/propuesta:**")
-            st.markdown(bullets([x.get("titulo") for x in est if x.get("titulo")]))
+            st.write("\n".join([f"- {x.get('titulo')}" for x in est if x.get("titulo")]))
         rp = fmt.get("requisitos_presentacion") or []
         if rp:
             st.markdown("**Requisitos de presentación:**")
-            st.markdown(bullets(rp))
+            st.write("\n".join([f"- {x}" for x in rp]))
         ra = fmt.get("requisitos_archivo") or {}
-        st.markdown(f"- **Formatos permitidos**: {', '.join(ra.get('formatos_permitidos') or []) or '—'}")
-        st.markdown(f"- **Tamaño máx (MB)**: {ra.get('tamano_max_mb') if ra.get('tamano_max_mb') is not None else '—'}")
-        st.markdown(f"- **Firma digital requerida**: {ra.get('firma_digital_requerida') if ra.get('firma_digital_requerida') is not None else '—'}")
-        st.markdown(f"- **Firmado por**: {ra.get('firmado_por') or '—'}")
-        st.markdown(f"- **Idioma**: {fmt.get('idioma') or '—'}")
-        st.markdown(f"- **Copias**: {fmt.get('copias') if fmt.get('copias') is not None else '—'}")
+        st.write(f"- **Formatos permitidos**: {', '.join(ra.get('formatos_permitidos') or []) or '—'}")
+        st.write(f"- **Tamaño máx (MB)**: {ra.get('tamano_max_mb') if ra.get('tamano_max_mb') is not None else '—'}")
+        st.write(f"- **Firma digital requerida**: {ra.get('firma_digital_requerida') if ra.get('firma_digital_requerida') is not None else '—'}")
+        st.write(f"- **Firmado por**: {ra.get('firmado_por') or '—'}")
+        st.write(f"- **Idioma**: {fmt.get('idioma') or '—'}")
+        st.write(f"- **Copias**: {fmt.get('copias') if fmt.get('copias') is not None else '—'}")
         ent = fmt.get("entrega") or {}
-        st.markdown(f"- **Canal de entrega**: {ent.get('canal') or '—'}")
-        st.markdown(f"- **Plazo/Fecha/Hora**: {ent.get('plazo') or '—'} / **Zona horaria**: {ent.get('zona_horaria') or '—'}")
+        st.write(f"- **Canal de entrega**: {ent.get('canal') or '—'}")
+        st.write(f"- **Plazo/Fecha/Hora**: {ent.get('plazo') or '—'} / **Zona horaria**: {ent.get('zona_horaria') or '—'}")
         if ent.get("instrucciones"):
             st.markdown("**Instrucciones de entrega:**")
-            st.markdown(bullets(ent.get("instrucciones") or []))
-        used = {'formato_esperado','longitud_paginas','tipografia','estructura_documental','requisitos_presentacion','requisitos_archivo','idioma','copias','entrega'}
-        render_extra_fields('Detalles adicionales (formato/entrega)', fmt, used)
+            st.write("\n".join([f"- {x}" for x in ent.get("instrucciones") or []]))
+        pag = fmt.get("paginacion") or {}
+        st.write(f"- **Paginación requerida**: {pag.get('requerida') if pag.get('requerida') is not None else '—'} "
+                 f"/ **Formato**: {pag.get('formato') or '—'}")
+        if fmt.get("etiquetado"):
+            st.markdown("**Etiquetado/Rotulación:**")
+            st.write("\n".join([f"- {x}" for x in (fmt.get("etiquetado") or [])]))
+        if fmt.get("anexos_obligatorios"):
+            st.markdown("**Anexos obligatorios:**")
+            st.write("\n".join([f"- {x}" for x in (fmt.get("anexos_obligatorios") or [])]))
+        if fmt.get("confidencialidad"):
+            st.markdown(f"**Confidencialidad:** {fmt.get('confidencialidad')}")
+        if fmt.get("discrepancias"):
+            st.caption("Discrepancias")
+            st.write("\n".join([f"- {d}" for d in (fmt.get("discrepancias") or [])]))
 
-    # =============== Riesgos ===============
+    # Riesgos / Exclusiones
     rx = fs_sections.get("riesgos_exclusiones", {})
-    with st.expander("⚠️ Riesgos y exclusiones"):
+    with st.expander("⚠️ Riesgos y exclusiones", expanded=False):
         ry = rx.get("riesgos_y_dudas")
-        st.markdown(f"**Riesgos y dudas (síntesis):** {ry or '—'}")
         ex = rx.get("exclusiones") or []
+        st.markdown(f"**Riesgos y dudas (síntesis):** {ry or '—'}")
         if ex:
             st.markdown("**Exclusiones:**")
-            st.markdown(bullets(ex))
+            st.write("\n".join([f"- {e}" for e in ex]))
         mrx = rx.get("matriz_riesgos") or []
         if mrx:
             try:
-                import pandas as pd
+                import pandas as pd  # type: ignore
                 st.caption("Matriz de riesgos (PxI)")
                 st.dataframe(pd.DataFrame(mrx), use_container_width=True, hide_index=True)
             except Exception:
-                for r in mrx: st.markdown(f"- {r}")
-        used = {'riesgos_y_dudas','exclusiones','matriz_riesgos'}
-        render_extra_fields('Detalles adicionales (riesgos/exclusiones)', rx, used)
+                for r in mrx:
+                    st.write(f"- {r}")
+        disc = rx.get("discrepancias") or []
+        if disc:
+            st.caption("Discrepancias")
+            st.write("\n".join([f"- {d}" for d in disc]))
 
-    # =============== Solvencia ===============
-    solv_root = fs_sections.get("solvencia", {})
-    solv = solv_root.get("solvencia", {})
-    with st.expander("📜 Solvencia y acreditación"):
+    # Solvencia
+    solv = fs_sections.get("solvencia", {}).get("solvencia", {})
+    with st.expander("📜 Solvencia y acreditación", expanded=False):
         col1, col2, col3 = st.columns(3)
         tec = solv.get("tecnica", [])
         eco = solv.get("economica", [])
         adm = solv.get("administrativa", [])
-        with col1: st.markdown("**Técnica**"); st.markdown(bullets(tec) or "—")
-        with col2: st.markdown("**Económica**"); st.markdown(bullets(eco) or "—")
-        with col3: st.markdown("**Administrativa**"); st.markdown(bullets(adm) or "—")
+        with col1:
+            st.markdown("**Técnica**")
+            st.write("\n".join([f"- {x}" for x in tec]) or "—")
+        with col2:
+            st.markdown("**Económica**")
+            st.write("\n".join([f"- {x}" for x in eco]) or "—")
+        with col3:
+            st.markdown("**Administrativa**")
+            st.write("\n".join([f"- {x}" for x in adm]) or "—")
         acr = solv.get("acreditacion") or []
         if acr:
             try:
-                import pandas as pd
+                import pandas as pd  # type: ignore
                 st.caption("Acreditación (cómo se demuestra)")
                 st.dataframe(pd.DataFrame(acr), use_container_width=True, hide_index=True)
             except Exception:
-                for a in acr: st.markdown(f"- {a}")
-        used = {'solvencia'}
-        render_extra_fields('Detalles adicionales (solvencia)', solv_root, used)
-else:
-    st.info("Realiza un análisis para ver resultados.")
+                for a in acr:
+                    st.write(f"- {a}")
 
-    # Logs tab
-    with tabs[1]:
-        st.subheader("Logs de prompts y respuestas")
-        logs = st.session_state.get("logs", {})
-        if not any(logs.values()):
-            st.info("Aún no hay logs. Ejecuta alguna sección.")
+# -----------------------------------------------------------------------------------
+# Markdown consolidado para descarga
+# -----------------------------------------------------------------------------------
+def _markdown_full(fs_sections: Dict[str, Any]) -> str:
+    out = ["# Análisis de Pliego – Resultado Completo\n"]
+    def add(h): out.append(h if h.endswith("\n") else h + "\n")
+
+    oc = fs_sections.get("objetivos_contexto", {})
+    svs = fs_sections.get("servicios", {})
+    im = fs_sections.get("importe", {})
+    cv_all = fs_sections.get("criterios_valoracion", {})
+    it = fs_sections.get("indice_tecnico", {})
+    fmt = fs_sections.get("formato_oferta", {})
+    rx = fs_sections.get("riesgos_exclusiones", {})
+    solv_all = fs_sections.get("solvencia", {}).get("solvencia", {})
+
+    add("## Objetivos y contexto")
+    add(f"- **Resumen**: {oc.get('resumen_servicios') or '—'}")
+    if oc.get("objetivos"):
+        add("**Objetivos**:")
+        for o in oc["objetivos"]: add(f"- {o}")
+    add(f"- **Alcance**: {oc.get('alcance') or '—'}\n")
+
+    add("## Servicios solicitados")
+    add(f"- **Resumen**: {svs.get('resumen_servicios') or '—'}")
+    det = svs.get("servicios_detalle") or []
+    if det:
+        add("**Detalle:**")
+        for d in det:
+            add(f"- {d.get('nombre')}: {d.get('descripcion') or ''}")
+
+    add("\n## Importe de licitación")
+    imp_total = im.get("importe_total")
+    moneda = im.get("moneda") or "EUR"
+    add(f"- **Importe total**: {f'{imp_total:.2f} {moneda}' if isinstance(imp_total, (int,float)) else '—'}")
+    add(f"- **IVA incluido**: {im.get('iva_incluido') if im.get('iva_incluido') is not None else '—'}")
+    add(f"- **Tipo IVA**: {im.get('tipo_iva') if im.get('tipo_iva') is not None else '—'}")
+    for d in (im.get("importes_detalle") or []):
+        add(f"  - {d.get('concepto') or '—'}: {d.get('importe')} {d.get('moneda') or moneda} ({d.get('observaciones') or ''})")
+
+    add("\n## Criterios de valoración")
+    cv = cv_all.get("criterios_valoracion") or []
+    if cv:
+        for c in cv:
+            add(f"- {c.get('nombre')} (peso: {c.get('peso_max')} {c.get('tipo') or ''}; "
+                f"umbral: {c.get('umbral_minimo')}; método: {c.get('metodo_evaluacion')})")
+            for s in (c.get("subcriterios") or []):
+                add(f"  - {s.get('nombre')} (peso: {s.get('peso_max')} {s.get('tipo') or ''})")
+        if cv_all.get("criterios_desempate"):
+            add("**Desempate:**")
+            for x in cv_all["criterios_desempate"]: add(f"- {x}")
+    else:
+        add("- —")
+
+    add("\n## Índice de la respuesta técnica")
+    req = it.get("indice_respuesta_tecnica") or []
+    prop = it.get("indice_propuesto") or []
+    add("**Solicitado**:")
+    if req:
+        for s in req:
+            add(f"- {s.get('titulo')}{': ' + (s.get('descripcion') or '') if s.get('descripcion') else ''}")
+            for sub in s.get("subapartados") or []:
+                add(f"  - {sub}")
+    else:
+        add("- —")
+    add("\n**Propuesto**:")
+    if prop:
+        for s in prop:
+            add(f"- {s.get('titulo')}{': ' + (s.get('descripcion') or '') if s.get('descripcion') else ''}")
+            for sub in s.get("subapartados") or []:
+                add(f"  - {sub}")
+    else:
+        add("- —")
+
+    add("\n## Formato y entrega de la oferta")
+    add(f"- **Formato esperado**: {fmt.get('formato_esperado') or '—'}")
+    add(f"- **Longitud (pág.)**: {fmt.get('longitud_paginas') if fmt.get('longitud_paginas') is not None else '—'}")
+    tip = fmt.get("tipografia") or {}
+    add(f"- **Tipografía**: {tip.get('familia') or '—'}; tamaño mín.: {tip.get('tamano_min') or '—'}; "
+        f"interlineado: {tip.get('interlineado') or '—'}; márgenes: {tip.get('margenes') or '—'}")
+    if fmt.get("estructura_documental"):
+        add("**Estructura documental:**")
+        for x in fmt.get("estructura_documental") or []:
+            add(f"- {x.get('titulo')}")
+    if fmt.get("requisitos_presentacion"):
+        add("**Requisitos de presentación:**")
+        for x in fmt.get("requisitos_presentacion") or []:
+            add(f"- {x}")
+    ra = fmt.get("requisitos_archivo") or {}
+    add(f"- **Formatos permitidos**: {', '.join(ra.get('formatos_permitidos') or []) or '—'}")
+    add(f"- **Tamaño máx (MB)**: {ra.get('tamano_max_mb') if ra.get('tamano_max_mb') is not None else '—'}")
+    add(f"- **Firma digital requerida**: {ra.get('firma_digital_requerida') if ra.get('firma_digital_requerida') is not None else '—'}")
+    add(f"- **Firmado por**: {ra.get('firmado_por') or '—'}")
+    add(f"- **Idioma**: {fmt.get('idioma') or '—'}")
+    add(f"- **Copias**: {fmt.get('copias') if fmt.get('copias') is not None else '—'}")
+    ent = fmt.get("entrega") or {}
+    add(f"- **Canal de entrega**: {ent.get('canal') or '—'}; **Plazo/Fecha/Hora**: {ent.get('plazo') or '—'}; "
+        f"**Zona horaria**: {ent.get('zona_horaria') or '—'}")
+    if ent.get("instrucciones"):
+        add("**Instrucciones de entrega:**")
+        for x in ent.get("instrucciones") or []:
+            add(f"- {x}")
+    pag = fmt.get("paginacion") or {}
+    add(f"- **Paginación**: requerida={pag.get('requerida') if pag.get('requerida') is not None else '—'}; "
+        f"formato={pag.get('formato') or '—'}")
+    if fmt.get("etiquetado"):
+        add("**Etiquetado/Rotulación:**")
+        for x in fmt.get("etiquetado") or []:
+            add(f"- {x}")
+    if fmt.get("anexos_obligatorios"):
+        add("**Anexos obligatorios:**")
+        for x in fmt.get("anexos_obligatorios") or []:
+            add(f"- {x}")
+    if fmt.get("confidencialidad"):
+        add(f"- **Confidencialidad**: {fmt.get('confidencialidad')}")
+
+    add("\n## Riesgos y exclusiones")
+    add(f"- **Riesgos y dudas**: {rx.get('riesgos_y_dudas') or '—'}")
+    ex = rx.get("exclusiones") or []
+    if ex:
+        add("**Exclusiones:**")
+        for e in ex: add(f"- {e}")
+    mrx = rx.get("matriz_riesgos") or []
+    if mrx:
+        add("**Matriz de riesgos (PxI):**")
+        for r in mrx:
+            add(f"- {r.get('riesgo')}: P={r.get('probabilidad_1_5')} I={r.get('impacto_1_5')}, "
+                f"C={r.get('criticidad_1_25')}; mit.: {r.get('mitigacion')}; resp.: {r.get('responsable')}")
+
+    add("\n## Solvencia y acreditación")
+    tec = solv_all.get("tecnica", [])
+    eco = solv_all.get("economica", [])
+    adm = solv_all.get("administrativa", [])
+    if tec:
+        add("**Técnica:**");  [add(f"- {x}") for x in tec]
+    if eco:
+        add("**Económica:**"); [add(f"- {x}") for x in eco]
+    if adm:
+        add("**Administrativa:**"); [add(f"- {x}") for x in adm]
+    acr = solv_all.get("acreditacion") or []
+    if acr:
+        add("**Acreditación:**")
+        for a in acr:
+            add(f"- {a.get('requisito')}: doc={a.get('documento_necesario')}, norma={a.get('norma_referencia')}, umbral={a.get('umbral')}")
+
+    return "\n".join(out)
+
+# -----------------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------------
+def sidebar_and_header():
+    login_gate()
+    model, temperature = sidebar_config()
+    st.title(APP_TITLE)
+    st.caption(f"Analizador de pliegos (GPT-4o / 4o-mini). Temperatura actual: **{temperature:.2f}**.")
+    return model, temperature
+
+def main():
+    model, temperature = sidebar_and_header()
+
+    # Carga de PDFs
+    files = st.file_uploader("Sube uno o varios PDFs del pliego", type=["pdf"], accept_multiple_files=True)
+    if not files:
+        st.info("Sube al menos un PDF para comenzar.")
+        st.stop()
+
+    # Tabulador: Análisis y Registro
+    tab1, tab2 = st.tabs(["Análisis", "Registro (Prompts/Respuestas)"])
+
+    with tab1:
+        # Preparación de PDFs (OpenAI + local)
+        if "fs_file_ids" not in st.session_state or st.button("Reindexar PDFs en OpenAI", use_container_width=True):
+            st.session_state.pop("fs_sections", None)
+
+            uploaded = [{"name": f.name, "bytes": f.read()} for f in files]
+
+            with st.spinner("Subiendo PDF(s) a OpenAI…"):
+                file_ids = []
+                for u in uploaded:
+                    up = _oai.files.create(
+                        file=(u["name"], u["bytes"], "application/pdf"),
+                        purpose="assistants",
+                    )
+                    file_ids.append(up.id)
+
+            local_docs, char_stats = [], []
+            for u in uploaded:
+                parsed = parse_pdf_cached(u["name"], u["bytes"])
+                local_docs.append({"name": u["name"], "pages": parsed["pages"]})
+                char_stats.append((u["name"], len(parsed["pages"]), parsed["total_chars"]))
+
+            st.session_state["fs_file_ids"] = file_ids
+            st.session_state["fs_local_docs"] = local_docs
+            st.session_state["char_stats"] = char_stats
+
+            st.success("PDF(s) preparados (OpenAI + texto local).")
+
+        # Diagnóstico
+        with st.expander("Diagnóstico de extracción", expanded=False):
+            for name, npages, nchar in st.session_state.get("char_stats", []):
+                st.write(f"- **{name}**: {npages} páginas, {nchar} caracteres")
+                if nchar < 1000:
+                    st.warning(f"{name}: muy poco texto (posible escaneado sin OCR).")
+
+        # Estado de ejecución
+        st.session_state.setdefault("busy", False)
+        st.session_state.setdefault("job", None)
+        st.session_state.setdefault("job_all", False)
+
+        def _start_job(section: Optional[str] = None, do_all: bool = False):
+            st.session_state["job"] = section
+            st.session_state["job_all"] = do_all
+            st.session_state["busy"] = True
+
+        # Controles
+        st.subheader("Controles de análisis")
+        dis = st.session_state["busy"]
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.button("Objetivos y contexto",   use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"section": "objetivos_contexto"})
+            st.button("Servicios solicitados",  use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"section": "servicios"})
+            st.button("Importe de licitación",  use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"section": "importe"})
+        with c2:
+            st.button("Criterios de valoración", use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"section": "criterios_valoracion"})
+            st.button("Índice de la respuesta técnica", use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"section": "indice_tecnico"})
+            st.button("Riesgos y exclusiones",   use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"section": "riesgos_exclusiones"})
+        with c3:
+            st.button("Criterios de solvencia",  use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"section": "solvencia"})
+            st.button("Formato y entrega de la oferta",  use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"section": "formato_oferta"})
+            st.button("🔎 Análisis Completo", type="primary", use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"do_all": True})
+
+        # Ejecución (con status)
+        if st.session_state["busy"]:
+            with st.status("Procesando análisis…", expanded=True) as status:
+                try:
+                    if st.session_state["job_all"]:
+                        order = list(SECTION_SPECS.keys())
+                        st.session_state.setdefault("fs_sections", {})
+                        prog = st.progress(0.0)
+                        for i, k in enumerate(order, start=1):
+                            spec = SECTION_SPECS[k]
+                            status.update(label=f"Analizando: {spec['titulo']}…")
+                            try:
+                                data, mode = run_section(
+                                    section_key=k,
+                                    model=model,
+                                    temperature=temperature,
+                                    max_chars=LOCAL_CONTEXT_MAX_CHARS,
+                                    file_ids=st.session_state["fs_file_ids"],
+                                )
+                                st.session_state["fs_sections"][k] = data
+                                status.write(f"✓ {spec['titulo']} ({mode})")
+                            except Exception as e:
+                                st.session_state["fs_sections"][k] = {}
+                                status.write(f"✗ {spec['titulo']}: {e}")
+                            prog.progress(i / len(order))
+                        status.update(label="Análisis completo finalizado", state="complete")
+                    else:
+                        k = st.session_state["job"]
+                        spec = SECTION_SPECS[k]
+                        status.update(label=f"Analizando: {spec['titulo']}…")
+                        data, mode = run_section(
+                            section_key=k,
+                            model=model,
+                            temperature=temperature,
+                            max_chars=LOCAL_CONTEXT_MAX_CHARS,
+                            file_ids=st.session_state["fs_file_ids"],
+                        )
+                        st.session_state.setdefault("fs_sections", {})
+                        st.session_state["fs_sections"][k] = data
+                        status.update(label=f"Sección '{spec['titulo']}' completada", state="complete")
+                finally:
+                    st.session_state["busy"] = False
+                    st.session_state["job"] = None
+                    st.session_state["job_all"] = False
+                    st.rerun()
+
+        # Resultados
+        st.subheader("Resultados")
+        fs_sections = st.session_state.get("fs_sections", {})
+        if not fs_sections:
+            st.info("Aún no hay resultados. Pulsa **Análisis Completo** o ejecuta alguna sección.")
         else:
-            for k, spec in SECTION_SPECS.items():
-                entries = logs.get(k, [])
-                with st.expander(f"Sección: {spec['titulo']} ({len(entries)} registros)", expanded=False):
-                    for i, e in enumerate(entries, start=1):
-                        st.caption(f"[{e.get('ts')}] model={e.get('model')} temp={e.get('temperature')} mode={e.get('mode')}")
-                        with st.popover(f"Prompt #{i}"):
-                            st.code(e.get("prompt") or "", language="markdown")
-                        with st.popover(f"Respuesta #{i}"):
-                            st.code((e.get("response") or "")[:20000], language="json")
+            render_full_view(fs_sections)
+            # Descargas
+            col1, col2 = st.columns(2)
+            with col1:
+                st.download_button(
+                    "Descargar análisis (Markdown)",
+                    data=_markdown_full(fs_sections=fs_sections),
+                    file_name="analisis_pliego.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+            with col2:
+                st.download_button(
+                    "Descargar JSON (Análisis completo)",
+                    data=json.dumps(fs_sections, indent=2, ensure_ascii=False),
+                    file_name="analisis_pliego.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
 
+    # Registro de prompts/respuestas (incluye Formato y Entrega)
+    with tab2:
+        st.caption("Vista de auditoría: prompt enviado y respuesta del modelo por sección/fase.")
+        _log_init()
+        st.button("🔄 Reinicializar/Normalizar listado de secciones", on_click=_log_init)
+
+        # Mostrar en orden fijo (incluye formato_oferta)
+        ordered = list(SECTION_SPECS.keys())
+        for k in ordered:
+            spec = SECTION_SPECS.get(k, {"titulo": k})
+            v = st.session_state["logs"].get(k, [])
+            with st.expander(f"🧭 {spec['titulo']} ({k}) — {len(v)} eventos", expanded=False):
+                if not v:
+                    st.info("Sin logs para esta sección todavía.")
+                    continue
+                for i, rec in enumerate(v, start=1):
+                    st.markdown(f"**#{i} – Fase:** `{rec.get('fase')}` | **Modelo:** `{rec.get('model')}`")
+                    st.markdown("**Prompt enviado:**")
+                    st.code(rec.get("prompt") or "", language="markdown")
+                    st.markdown("**Respuesta (cruda):**")
+                    st.code(rec.get("response") or "", language="json")
+                    st.divider()
+
+# -----------------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
