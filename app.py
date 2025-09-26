@@ -427,6 +427,137 @@ def _file_search_section_call(
     except Exception:
         return _force_jsonify_from_text(section_key, text, model, temperature)
 
+def _merge_section_payload(section_key: str, acc: Dict[str, Any], part: Dict[str, Any]) -> Dict[str, Any]:
+    """Fusión simple y determinista para cada sección."""
+    if section_key == "objetivos_contexto":
+        acc["resumen_servicios"] = max([acc.get("resumen_servicios"), part.get("resumen_servicios")], key=lambda x: len(x or ""), default=None)
+        acc["alcance"] = max([acc.get("alcance"), part.get("alcance")], key=lambda x: len(x or ""), default=None)
+        acc["objetivos"] = list({*(acc.get("objetivos") or []), * (part.get("objetivos") or [])})
+        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        return acc
+
+    if section_key == "servicios":
+        acc["resumen_servicios"] = max([acc.get("resumen_servicios"), part.get("resumen_servicios")], key=lambda x: len(x or ""), default=None)
+        acc["alcance"] = max([acc.get("alcance"), part.get("alcance")], key=lambda x: len(x or ""), default=None)
+        acc["servicios_detalle"] = (acc.get("servicios_detalle") or []) + (part.get("servicios_detalle") or [])
+        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        return acc
+
+    if section_key == "importe":
+        acc["importe_total"] = acc.get("importe_total") or part.get("importe_total")
+        acc["moneda"] = acc.get("moneda") or part.get("moneda")
+        acc["importes_detalle"] = (acc.get("importes_detalle") or []) + (part.get("importes_detalle") or [])
+        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        return acc
+
+    if section_key == "criterios_valoracion":
+        acc["criterios_valoracion"] = (acc.get("criterios_valoracion") or []) + (part.get("criterios_valoracion") or [])
+        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        return acc
+
+    if section_key == "indice_tecnico":
+        acc["indice_respuesta_tecnica"] = (acc.get("indice_respuesta_tecnica") or []) + (part.get("indice_respuesta_tecnica") or [])
+        acc["indice_propuesto"] = (acc.get("indice_propuesto") or []) + (part.get("indice_propuesto") or [])
+        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        return acc
+
+    if section_key == "riesgos_exclusiones":
+        # mantiene texto más largo y concatena exclusiones
+        acc["riesgos_y_dudas"] = max([acc.get("riesgos_y_dudas"), part.get("riesgos_y_dudas")], key=lambda x: len(x or ""), default=None)
+        acc["exclusiones"] = list({*(acc.get("exclusiones") or []), * (part.get("exclusiones") or [])})
+        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        return acc
+
+    if section_key == "solvencia":
+        sv = acc.get("solvencia") or {"tecnica": [], "economica": [], "administrativa": []}
+        part_sv = part.get("solvencia") or {"tecnica": [], "economica": [], "administrativa": []}
+        sv["tecnica"] = list({*sv.get("tecnica", []), *part_sv.get("tecnica", [])})
+        sv["economica"] = list({*sv.get("economica", []), *part_sv.get("economica", [])})
+        sv["administrativa"] = list({*sv.get("administrativa", []), *part_sv.get("administrativa", [])})
+        acc["solvencia"] = sv
+        acc["referencias_paginas"] = list({*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])})
+        return acc
+
+    return acc
+
+
+def _empty_payload_for_section(section_key: str) -> Dict[str, Any]:
+    if section_key == "objetivos_contexto":
+        return {"resumen_servicios": None, "objetivos": [], "alcance": None, "referencias_paginas": []}
+    if section_key == "servicios":
+        return {"resumen_servicios": None, "servicios_detalle": [], "alcance": None, "referencias_paginas": []}
+    if section_key == "importe":
+        return {"importe_total": None, "moneda": None, "importes_detalle": [], "referencias_paginas": []}
+    if section_key == "criterios_valoracion":
+        return {"criterios_valoracion": [], "referencias_paginas": []}
+    if section_key == "indice_tecnico":
+        return {"indice_respuesta_tecnica": [], "indice_propuesto": [], "referencias_paginas": []}
+    if section_key == "riesgos_exclusiones":
+        return {"riesgos_y_dudas": None, "exclusiones": [], "referencias_paginas": []}
+    if section_key == "solvencia":
+        return {"solvencia": {"tecnica": [], "economica": [], "administrativa": []}, "referencias_paginas": []}
+    return {}
+
+
+def _local_map_reduce_section(section_key: str, model: str, temperature: float, max_chars: int):
+    """
+    Ejecuta prompts por sección sobre chunks locales y fusiona resultados.
+    """
+    docs = st.session_state.get("fs_local_docs", [])
+    if not docs:
+        raise RuntimeError("No hay texto local para fallback. Reindexa los PDFs.")
+
+    # Construye chunks (unidos entre documentos)
+    all_chunks: List[str] = []
+    for d in docs:
+        all_chunks.extend(chunk_text(d["pages"], max_chars=max_chars))
+
+    # System + esquema a usar (del SECTION_SPECS)
+    sys_msg = {"role": "system", "content": [{"type": "input_text", "text": (
+        "Eres un analista experto en licitaciones públicas en España. "
+        "Devuelve SIEMPRE JSON válido. Si el fragmento no contiene la información, devuelve campos vacíos/null."
+    )}]}
+    schema_hint = SECTION_SPECS[section_key]["user_prompt"]
+    acc = _empty_payload_for_section(section_key)
+
+    # Itera chunks → llama a Responses → merge
+    for ch in all_chunks:
+        usr = {"role": "user", "content": [{
+            "type": "input_text",
+            "text": (
+                f"Extrae SOLO la sección solicitada según este esquema (JSON):\n{schema_hint}\n\n"
+                "Texto del pliego (fragmento):\n<<<\n" + ch[:15000] + "\n>>>\n"
+                "Responde únicamente con JSON válido UTF-8."
+            )
+        }]}
+
+        args = dict(
+            model=(model or OPENAI_MODEL).strip(),
+            input=[sys_msg, usr],
+            response_format={"type": "json_object"},
+            max_output_tokens=MAX_TOKENS_PER_REQUEST,
+        )
+        if temperature is not None:
+            args["temperature"] = float(temperature)
+        if args["model"].lower().startswith("gpt-5"):
+            args.pop("temperature", None)
+            args.pop("response_format", None)
+
+        try:
+            rsp = _responses_create_robust(args)
+            text = _coalesce_text_from_responses(rsp)
+            if not text:
+                # intentamos rascar JSON del dump
+                text = _extract_json_block(json.dumps(rsp, default=str))
+            part = _json_loads_robust(text)
+        except Exception:
+            # chunk sin señal → parte vacía
+            part = _empty_payload_for_section(section_key)
+
+        acc = _merge_section_payload(section_key, acc, part)
+
+    return acc
+
 
 # ---------------------------------------------------------------------
 # Fallback local por secciones (si el endpoint no admite File Search)
@@ -506,32 +637,26 @@ def _fallback_local_section(section_key: str, model: str, temperature: float, ma
         return {"mensaje": "Sección no reconocida", "section_key": section_key}
 
 def _run_section_with_fallback(section_key: str, vs_id: str, file_ids: List[str], model: str, temperature: float, max_chars: int):
-    """
-    Intenta File Search. Si el servidor rechaza parámetros (Unknown parameter: attachments/tool_resources),
-    cae a fallback local por chunks.
-    """
-    spec = SECTION_SPECS[section_key]
+    # 1º intento: File Search (si el servidor lo soporta y devuelve algo)
     try:
         data = _file_search_section_call(
             vector_store_id=vs_id,
-            user_prompt=spec["user_prompt"],
+            user_prompt=SECTION_SPECS[section_key]["user_prompt"],
             model=model,
             temperature=temperature,
             file_ids=file_ids,
             section_key=section_key,
         )
+        # ¿vino vacío?
+        if not data or all((v in (None, [], {}) for v in data.values())):
+            raise RuntimeError("File Search devolvió JSON vacío.")
         return data, "file_search"
     except Exception as e:
         msg = str(e)
-        if ("Unknown parameter: 'attachments'" in msg) or ("Unknown parameter: 'tool_resources'" in msg) \
-           or ("unknown_parameter" in msg) or ("unsupported" in msg.lower()):
-            data = _fallback_local_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
-            return data, "local_fallback"
-        # Si falló por no-JSON u otro formato, también hacemos fallback local
-        if ("no contiene JSON" in msg) or ("cadena vacía" in msg) or ("Respuesta vacía" in msg):
-            data = _fallback_local_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
-            return data, "local_fallback"
-        raise
+        # Cualquier rechazo/ausencia → Map-Reduce local
+        data = _local_map_reduce_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
+        return data, "local_map_reduce"
+
 
 
 # ---------------------------------------------------------------------
@@ -696,7 +821,17 @@ def main():
                     "name": u["name"],
                     "pages": pages,
                 })
-
+            char_stats = []
+            for d in local_docs:
+                total_chars = sum(len(p or "") for p in d["pages"])
+                char_stats.append((d["name"], len(d["pages"]), total_chars))
+            
+            st.info("Texto extraído por PDF (diagnóstico):")
+            for name, npages, nchar in char_stats:
+                st.write(f"- **{name}**: {npages} páginas, {nchar} caracteres extraídos")
+                if nchar < 1000:
+                    st.warning(f"{name}: muy poco texto extraído (posible PDF escaneado sin OCR).")
+        
             st.session_state["fs_vs_id"] = vs_id
             st.session_state["fs_file_ids"] = file_ids
             st.session_state["fs_local_docs"] = local_docs
