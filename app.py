@@ -1,11 +1,12 @@
 # app.py
 # -----------------------------------------------------------------------------------
 # RFP Analyzer – Streamlit (consultoría TI) | "PDF completo" + fallback local
-# - Modelos visibles: gpt-4o y gpt-4o-mini
+# - Modelos visibles: gpt-4o y gpt-4o-mini (temperatura fija = 0.2)
 # - UX de una sola vista de análisis + una pestaña de "Registro (Prompts/Respuestas)"
 # - Sin file_search ni attachments: enviamos los PDFs como input_file a /responses
 # - Fallback local con selección de páginas relevantes y síntesis garantizada
 # - Prompts robustos: JSON obligatorio, evidencias, discrepancias, no alucinar
+# - NUEVO: Sección "Formato y entrega de la oferta"
 # -----------------------------------------------------------------------------------
 
 import os
@@ -131,7 +132,7 @@ def login_gate():
     st.stop()
 
 # -----------------------------------------------------------------------------------
-# Prompts “excelentes”: SYSTEM + SECCIONES
+# Prompts “excelentes”: SYSTEM + SECCIONES (incluye nueva sección formato_oferta)
 # -----------------------------------------------------------------------------------
 SYSTEM_PREFIX = (
   "Eres analista sénior de licitaciones en España y consultor TI."
@@ -277,7 +278,7 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
   "indice_tecnico": {
     "titulo": "Índice de la respuesta técnica",
     "user_prompt": (
-      "1) Analiza en detalle la licitación e identifica, si existe, el detalle del índice solicitado para la respuesta técnica, incluyendo secciones y contenido. 2) Si no existiera, propon en base al pliego un índice alineado (implementable), ordenado, empezando por contexto, metodología de trabajo, alcance, planificación, equipo etc."
+      "1) Analiza en detalle la propuesta e identifica, si existe, el índice solicitado literal para la respuesta técnica. 2) Si no existiera, propon en base al pliego un índice alineado (implementable), que contenga contexto, nuestro enfoque, metodología, alcance y actividades, planificación, equipo, etc"
       " Devuelve SIEMPRE las claves."
       "\nSalida JSON EXACTA:\n"
       "{"
@@ -359,6 +360,66 @@ SECTION_SPECS: Dict[str, Dict[str, str]] = {
       "}"
     ),
   },
+  # -------- NUEVA SECCIÓN: Formato y entrega de la oferta --------
+  "formato_oferta": {
+    "titulo": "Formato y entrega de la oferta",
+    "user_prompt": (
+      "Extrae requisitos de formato y entrega de la oferta (memoria técnica/administrativa), tales como: extensión máxima en "
+      "páginas, tamaño mínimo de fuente, tipografía, interlineado, márgenes, estructura documental requerida, idioma, número de copias, "
+      "formato/s de archivo permitido (PDF/DOCX/etc.), tamaño máximo por archivo, necesidad de firma digital y quién debe firmar, "
+      "paginación/ numeración requerida, etiquetado de sobres/archivos, canal de entrega (plataforma, registro, sobre electrónico), "
+      "plazo/fecha/hora y zona horaria, instrucciones de presentación y anexos obligatorios. Devuelve SIEMPRE las claves."
+      "\nSalida JSON EXACTA:\n"
+      "{"
+      '  "formato_esperado": str|null,'
+      '  "longitud_paginas": int|null,'
+      '  "tipografia": {"familia": str|null, "tamano_min": float|null, "interlineado": float|null, "margenes": str|null},'
+      '  "estructura_documental": [ {"titulo": str, "observaciones": str|null} ],'
+      '  "requisitos_presentacion": [str],'
+      '  "requisitos_archivo": {'
+      '     "formatos_permitidos": [str],'
+      '     "tamano_max_mb": float|null,'
+      '     "firma_digital_requerida": bool|null,'
+      '     "firmado_por": str|null'
+      '  },'
+      '  "idioma": str|null,'
+      '  "copias": int|null,'
+      '  "entrega": {'
+      '     "canal": str|null,'
+      '     "plazo": str|null,'
+      '     "zona_horaria": str|null,'
+      '     "instrucciones": [str]'
+      '  },'
+      '  "paginacion": {"requerida": bool|null, "formato": str|null},'
+      '  "etiquetado": [str],'
+      '  "anexos_obligatorios": [str],'
+      '  "confidencialidad": str|null,'
+      '  "referencias_paginas": [int],'
+      '  "evidencias": [{"pagina": int, "cita": str}],'
+      '  "discrepancias": [str]'
+      "}"
+      "\nReglas: no inventes; si no hay dato, usa null/[]; convierte longitudes numéricas cuando sea posible."
+      "\nEjemplo (mínimo):\n"
+      '{'
+      '  "formato_esperado": null,'
+      '  "longitud_paginas": null,'
+      '  "tipografia": {"familia": null, "tamano_min": null, "interlineado": null, "margenes": null},'
+      '  "estructura_documental": [],'
+      '  "requisitos_presentacion": [],'
+      '  "requisitos_archivo": {"formatos_permitidos": [], "tamano_max_mb": null, "firma_digital_requerida": null, "firmado_por": null},'
+      '  "idioma": null,'
+      '  "copias": null,'
+      '  "entrega": {"canal": null, "plazo": null, "zona_horaria": null, "instrucciones": []},'
+      '  "paginacion": {"requerida": null, "formato": null},'
+      '  "etiquetado": [],'
+      '  "anexos_obligatorios": [],'
+      '  "confidencialidad": null,'
+      '  "referencias_paginas": [],'
+      '  "evidencias": [],'
+      '  "discrepancias": []'
+      "}"
+    ),
+  },
 }
 
 # -----------------------------------------------------------------------------------
@@ -403,11 +464,25 @@ SECTION_KEYWORDS = {
       "requisitos de solvencia": 6, "clasificación": 4, "experiencia": 4,
       "medios personales": 4, "medios materiales": 4, "acreditación": 5,
   },
+  # NUEVO: formato_oferta
+  "formato_oferta": {
+      "formato": 6, "formato de la oferta": 7, "formato de la propuesta": 6,
+      "presentación de ofertas": 7, "presentacion de ofertas": 7, "presentación": 5,
+      "memoria técnica": 6, "longitud": 6, "páginas": 6, "paginas": 6, "extensión": 6, "extension": 6,
+      "tamaño de letra": 6, "tamano de letra": 6, "tipografía": 5, "tipografia": 5,
+      "interlineado": 5, "márgenes": 5, "margenes": 5, "fuente": 5, "tipo de letra": 5,
+      "etiquetado": 5, "rotulación": 5, "rotulacion": 5, "sobres": 6, "sobre electrónico": 6,
+      "plataforma": 6, "perfil del contratante": 5, "archivo pdf": 6, "pdf": 5, "docx": 4,
+      "firma electrónica": 6, "firma digital": 6, "firmado": 5,
+      "idioma": 5, "copia": 5, "copias": 5, "paginación": 5, "numeración": 5,
+      "fecha de entrega": 6, "plazo de presentación": 6, "hora": 5, "zona horaria": 4,
+  },
 }
 
 SECTION_CONTEXT_TUNING = {
     "indice_tecnico": {"max_chars": 80_000, "window": 2},
     "riesgos_exclusiones": {"max_chars": 60_000, "window": 2},
+    "formato_oferta": {"max_chars": 60_000, "window": 2},
 }
 
 # -----------------------------------------------------------------------------------
@@ -715,6 +790,7 @@ REQUIRED_NONEMPTY = {
     "indice_tecnico": ["indice_propuesto"],
     "riesgos_exclusiones": ["riesgos_y_dudas", "exclusiones", "matriz_riesgos"],
     "solvencia": ["solvencia"],
+    "formato_oferta": ["formato_esperado", "requisitos_presentacion", "requisitos_archivo", "estructura_documental"],
 }
 
 def _is_effectively_empty(section_key: str, data: Dict[str, Any]) -> bool:
@@ -843,7 +919,7 @@ def sidebar_config() -> Tuple[str, float]:
         else:
             idx = 0
         model = st.selectbox("Modelo OpenAI", AVAILABLE_MODELS, index=idx)
-        st.caption("Temperatura fija: 0.5")
+        st.caption("Temperatura fija: 0.2")
     return model, FIXED_TEMPERATURE
 
 # -----------------------------------------------------------------------------------
@@ -1003,6 +1079,51 @@ def render_full_view(fs_sections: Dict[str, Any]):
             st.caption("Discrepancias")
             st.write("\n".join([f"- {d}" for d in disc]))
 
+    # NUEVO: Formato y entrega de la oferta
+    fmt = fs_sections.get("formato_oferta", {})
+    with st.expander("🧾 Formato y entrega de la oferta", expanded=False):
+        st.markdown(f"**Formato esperado:** {fmt.get('formato_esperado') or '—'}")
+        lp = fmt.get("longitud_paginas")
+        st.write(f"- **Longitud (pág.)**: {lp if isinstance(lp, (int, float)) else '—'}")
+        tip = fmt.get("tipografia") or {}
+        st.write(f"- **Tipografía**: {tip.get('familia') or '—'} / **Tamaño mínimo**: {tip.get('tamano_min') or '—'} / "
+                 f"**Interlineado**: {tip.get('interlineado') or '—'} / **Márgenes**: {tip.get('margenes') or '—'}")
+        est = fmt.get("estructura_documental") or []
+        if est:
+            st.markdown("**Estructura documental requerida/propuesta:**")
+            st.write("\n".join([f"- {x.get('titulo')}" for x in est if x.get("titulo")]))
+        rp = fmt.get("requisitos_presentacion") or []
+        if rp:
+            st.markdown("**Requisitos de presentación:**")
+            st.write("\n".join([f"- {x}" for x in rp]))
+        ra = fmt.get("requisitos_archivo") or {}
+        st.write(f"- **Formatos permitidos**: {', '.join(ra.get('formatos_permitidos') or []) or '—'}")
+        st.write(f"- **Tamaño máx (MB)**: {ra.get('tamano_max_mb') if ra.get('tamano_max_mb') is not None else '—'}")
+        st.write(f"- **Firma digital requerida**: {ra.get('firma_digital_requerida') if ra.get('firma_digital_requerida') is not None else '—'}")
+        st.write(f"- **Firmado por**: {ra.get('firmado_por') or '—'}")
+        st.write(f"- **Idioma**: {fmt.get('idioma') or '—'}")
+        st.write(f"- **Copias**: {fmt.get('copias') if fmt.get('copias') is not None else '—'}")
+        ent = fmt.get("entrega") or {}
+        st.write(f"- **Canal de entrega**: {ent.get('canal') or '—'}")
+        st.write(f"- **Plazo/Fecha/Hora**: {ent.get('plazo') or '—'} / **Zona horaria**: {ent.get('zona_horaria') or '—'}")
+        if ent.get("instrucciones"):
+            st.markdown("**Instrucciones de entrega:**")
+            st.write("\n".join([f"- {x}" for x in ent.get("instrucciones") or []]))
+        pag = fmt.get("paginacion") or {}
+        st.write(f"- **Paginación requerida**: {pag.get('requerida') if pag.get('requerida') is not None else '—'} "
+                 f"/ **Formato**: {pag.get('formato') or '—'}")
+        if fmt.get("etiquetado"):
+            st.markdown("**Etiquetado/Rotulación:**")
+            st.write("\n".join([f"- {x}" for x in (fmt.get("etiquetado") or [])]))
+        if fmt.get("anexos_obligatorios"):
+            st.markdown("**Anexos obligatorios:**")
+            st.write("\n".join([f"- {x}" for x in (fmt.get("anexos_obligatorios") or [])]))
+        if fmt.get("confidencialidad"):
+            st.markdown(f"**Confidencialidad:** {fmt.get('confidencialidad')}")
+        if fmt.get("discrepancias"):
+            st.caption("Discrepancias")
+            st.write("\n".join([f"- {d}" for d in (fmt.get("discrepancias") or [])]))
+
     # Riesgos / Exclusiones
     rx = fs_sections.get("riesgos_exclusiones", {})
     with st.expander("⚠️ Riesgos y exclusiones", expanded=False):
@@ -1064,6 +1185,7 @@ def _markdown_full(fs_sections: Dict[str, Any]) -> str:
     im = fs_sections.get("importe", {})
     cv_all = fs_sections.get("criterios_valoracion", {})
     it = fs_sections.get("indice_tecnico", {})
+    fmt = fs_sections.get("formato_oferta", {})
     rx = fs_sections.get("riesgos_exclusiones", {})
     solv_all = fs_sections.get("solvencia", {}).get("solvencia", {})
 
@@ -1119,6 +1241,49 @@ def _markdown_full(fs_sections: Dict[str, Any]) -> str:
     else:
         add("- —")
 
+    # NUEVO: Formato y entrega de la oferta
+    add("\n## Formato y entrega de la oferta")
+    add(f"- **Formato esperado**: {fmt.get('formato_esperado') or '—'}")
+    add(f"- **Longitud (pág.)**: {fmt.get('longitud_paginas') if fmt.get('longitud_paginas') is not None else '—'}")
+    tip = fmt.get("tipografia") or {}
+    add(f"- **Tipografía**: {tip.get('familia') or '—'}; tamaño mín.: {tip.get('tamano_min') or '—'}; "
+        f"interlineado: {tip.get('interlineado') or '—'}; márgenes: {tip.get('margenes') or '—'}")
+    if fmt.get("estructura_documental"):
+        add("**Estructura documental:**")
+        for x in fmt.get("estructura_documental") or []:
+            add(f"- {x.get('titulo')}")
+    if fmt.get("requisitos_presentacion"):
+        add("**Requisitos de presentación:**")
+        for x in fmt.get("requisitos_presentacion") or []:
+            add(f"- {x}")
+    ra = fmt.get("requisitos_archivo") or {}
+    add(f"- **Formatos permitidos**: {', '.join(ra.get('formatos_permitidos') or []) or '—'}")
+    add(f"- **Tamaño máx (MB)**: {ra.get('tamano_max_mb') if ra.get('tamano_max_mb') is not None else '—'}")
+    add(f"- **Firma digital requerida**: {ra.get('firma_digital_requerida') if ra.get('firma_digital_requerida') is not None else '—'}")
+    add(f"- **Firmado por**: {ra.get('firmado_por') or '—'}")
+    add(f"- **Idioma**: {fmt.get('idioma') or '—'}")
+    add(f"- **Copias**: {fmt.get('copias') if fmt.get('copias') is not None else '—'}")
+    ent = fmt.get("entrega") or {}
+    add(f"- **Canal de entrega**: {ent.get('canal') or '—'}; **Plazo/Fecha/Hora**: {ent.get('plazo') or '—'}; "
+        f"**Zona horaria**: {ent.get('zona_horaria') or '—'}")
+    if ent.get("instrucciones"):
+        add("**Instrucciones de entrega:**")
+        for x in ent.get("instrucciones") or []:
+            add(f"- {x}")
+    pag = fmt.get("paginacion") or {}
+    add(f"- **Paginación**: requerida={pag.get('requerida') if pag.get('requerida') is not None else '—'}; "
+        f"formato={pag.get('formato') or '—'}")
+    if fmt.get("etiquetado"):
+        add("**Etiquetado/Rotulación:**")
+        for x in fmt.get("etiquetado") or []:
+            add(f"- {x}")
+    if fmt.get("anexos_obligatorios"):
+        add("**Anexos obligatorios:**")
+        for x in fmt.get("anexos_obligatorios") or []:
+            add(f"- {x}")
+    if fmt.get("confidencialidad"):
+        add(f"- **Confidencialidad**: {fmt.get('confidencialidad')}")
+
     add("\n## Riesgos y exclusiones")
     add(f"- **Riesgos y dudas**: {rx.get('riesgos_y_dudas') or '—'}")
     ex = rx.get("exclusiones") or []
@@ -1157,7 +1322,7 @@ def sidebar_and_header():
     login_gate()
     model, temperature = sidebar_config()
     st.title(APP_TITLE)
-    st.caption("Analizador de pliegos con enfoque de consultoría TI (GPT-4o / 4o-mini). Temperatura fija (0.5).")
+    st.caption("Analizador de pliegos con enfoque de consultoría TI (GPT-4o / 4o-mini). Temperatura fija (0.2).")
     return model, temperature
 
 def main():
@@ -1240,7 +1405,8 @@ def main():
         with c3:
             st.button("Criterios de solvencia",  use_container_width=True, disabled=dis,
                       on_click=_start_job, kwargs={"section": "solvencia"})
-            st.write("")
+            st.button("Formato y entrega de la oferta",  use_container_width=True, disabled=dis,
+                      on_click=_start_job, kwargs={"section": "formato_oferta"})
             st.button("🔎 Análisis Completo", type="primary", use_container_width=True, disabled=dis,
                       on_click=_start_job, kwargs={"do_all": True})
 
