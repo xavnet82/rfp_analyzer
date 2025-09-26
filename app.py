@@ -138,8 +138,8 @@ def _fallback_extract_pdf_text(file_like: io.BytesIO) -> Tuple[List[str], str]:
                 # OCR best-effort; keep PyPDF2 text if OCR fails
                 pass
 
-        return pages, "\n".join(pages)
-        
+        return pages, "
+".join(pages)".join(pages)".join(pages)
     except Exception as e:
         raise RuntimeError(f"Fallo al parsear PDF (fallback): {e}")
 try:
@@ -616,9 +616,49 @@ def _score_page(text: str, weights: dict) -> int:
         return 0
     t = text.lower()
     score = 0
-    for kw, w in weights.items():
-        score += t.count(kw) * w
-    return score
+    # Defensive: weights might contain non-numeric values (e.g., dicts)
+    for kw, w in (weights or {}).items():
+        if not isinstance(kw, str):
+            continue
+        # normalize weight
+        if isinstance(w, (int, float)):
+            ww = float(w)
+        elif isinstance(w, dict):
+            # try common keys
+            for k in ("weight", "w", "score", "val"):
+                if k in w and isinstance(w[k], (int, float)):
+                    ww = float(w[k])
+                    break
+            else:
+                ww = 1.0
+        else:
+            ww = 1.0
+        try:
+            score += t.count(kw.lower()) * ww
+        except Exception:
+            # if kw has regex specials or other issues, fallback to plain find loop
+            cnt = 0
+            start = 0
+            while True:
+                idx = t.find(kw.lower(), start)
+                if idx == -1:
+                    break
+                cnt += 1
+                start = idx + max(1, len(kw))
+            score += cnt * ww
+
+    # Bonus por posibles encabezados de secciones relevantes
+    if any(h in t for h in [
+        "criterios de valoración", "criterios de adjudicación", "presentación de ofertas",
+        "formato de la oferta", "formato de la propuesta", "índice", "indice",
+        "memoria técnica", "contenido mínimo", "contenido de la oferta",
+        "objeto del contrato", "alcance del servicio", "contexto y objetivos"
+    ]):
+        score += 15
+    try:
+        return int(score)
+    except Exception:
+        return 0
 
 def _select_relevant_spans(pages: List[str], section_key: str,
                            max_chars: int = LOCAL_CONTEXT_MAX_CHARS, window: int = 1) -> str:
