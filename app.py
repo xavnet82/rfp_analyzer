@@ -137,8 +137,7 @@ def _fallback_extract_pdf_text(file_like: io.BytesIO) -> Tuple[List[str], str]:
             except Exception:
                 # OCR best-effort; keep PyPDF2 text if OCR fails
                 pass
-
-    return pages, "\n".join(pages)
+        return pages, "\n".join(pages)
     
     except Exception as e:
         raise RuntimeError(f"Fallo al parsear PDF (fallback): {e}")
