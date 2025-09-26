@@ -26,6 +26,55 @@ if not OPENAI_API_KEY:
 
 client = create_client(OPENAI_API_KEY)
 
+def _to_float(x):
+    try:
+        if isinstance(x, str):
+            x = x.replace('.', '').replace(',', '.').replace('€','').replace('$','').strip()
+        return float(x)
+    except Exception:
+        return None
+
+def _curr_symbol(c):
+    if not c: return ""
+    c = str(c).upper()
+    return {"EUR":"€","USD":"$","GBP":"£","MXN":"$","COP":"$","CLP":"$","ARS":"$","BRL":"R$"}.get(c, c)
+
+def fmt_money(value, currency="EUR"):
+    v = _to_float(value)
+    if v is None: return "—"
+    s = _curr_symbol(currency)
+    return f"{v:,.2f} {s}".replace(",", "_").replace(".", ",").replace("_", ".")
+
+def render_extra_fields(title: str, data: dict, used_keys: set):
+    if not isinstance(data, dict): 
+        return
+    extra = {k:v for k,v in data.items() if k not in used_keys and v not in (None, "", [], {})}
+    if not extra:
+        return
+    with st.expander(title, expanded=False):
+        for k, v in extra.items():
+            header = k.replace("_"," ").capitalize()
+            if isinstance(v, list):
+                if v and isinstance(v[0], dict):
+                    try:
+                        import pandas as pd
+                        st.dataframe(pd.DataFrame(v), use_container_width=True, hide_index=True)
+                    except Exception:
+                        for it in v:
+                            st.markdown(f"- {it}")
+                else:
+                    for it in v:
+                        st.markdown(f"- {it}")
+            elif isinstance(v, dict):
+                try:
+                    import pandas as pd
+                    st.dataframe(pd.DataFrame([v]), use_container_width=True, hide_index=True)
+                except Exception:
+                    st.markdown("; ".join(f"**{a}:** {b}" for a,b in v.items()))
+            else:
+                st.markdown(f"**{header}:** {v}")
+
+
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 def login():
@@ -207,8 +256,8 @@ def main():
             st.session_state["local_docs"] = local_docs
             # Reinicia resultados al recargar
             st.session_state["sections"] = {}
-            # Mantén logs, pero podríamos limpiarlos si se prefiere:
-            # st.session_state["logs"] = {}
+            # Limpia logs según petición del usuario
+            st.session_state["logs"] = {}
         st.success("Ficheros listos.")
     if "file_ids" not in st.session_state:
         st.stop()
@@ -279,6 +328,10 @@ def main():
                     st.markdown("**Objetivos**:")
                     st.markdown(bullets(oc.get("objetivos") or []))
                 st.markdown(f"**Alcance:** {oc.get('alcance') or '—'}")
+        if oc.get('referencias_paginas'):
+            st.markdown("**Referencias de páginas:**")
+            st.markdown(bullets([str(x) for x in (oc.get('referencias_paginas') or [])]))
+        render_extra_fields("Detalles adicionales (objetivos/contexto)", oc, {'resumen_servicios','objetivos','alcance','referencias_paginas'})
 
             # Servicios
             svs = fs_sections.get("servicios", {})
@@ -306,18 +359,52 @@ def main():
                 else:
                     st.info("Sin servicios detallados explícitos en el texto analizado.")
 
-            # Importe
-            im = fs_sections.get("importe", {})
-            with st.expander("💶 Importe de licitación"):
-                imp_total = im.get("importe_total")
-                moneda = im.get("moneda") or "EUR"
-                st.markdown(f"**Importe total:** {f'{imp_total:.2f} {moneda}' if isinstance(imp_total, (int,float)) else '—'}")
-                st.markdown(f"- **IVA incluido:** {im.get('iva_incluido') if im.get('iva_incluido') is not None else '—'}")
-                st.markdown(f"- **Tipo IVA:** {im.get('tipo_iva') if im.get('tipo_iva') is not None else '—'}")
-                for x in (im.get("importes_detalle") or []):
-                    st.markdown(f"- {x}")
+            
+# Importe
+im = fs_sections.get("importe", {})
+with st.expander("💶 Importe de licitación"):
+    imp_total = im.get("importe_total")
+    moneda = im.get("moneda") or "EUR"
+    st.markdown(f"**Importe total:** {fmt_money(imp_total, moneda)}")
+    st.markdown(f"- **IVA incluido:** {im.get('iva_incluido') if im.get('iva_incluido') is not None else '—'}")
+    st.markdown(f"- **Tipo IVA:** {im.get('tipo_iva') if im.get('tipo_iva') is not None else '—'}")
 
-            # Criterios de valoración
+    # Detalle (tabla)
+    det = im.get("importes_detalle") or []
+    if det:
+        try:
+            import pandas as pd
+            rows = []
+            for d in det:
+                per = d.get("periodo") or {}
+                rows.append({
+                    "Concepto": d.get("concepto"),
+                    "Importe": _to_float(d.get("importe")),
+                    "Importe (fmt)": fmt_money(d.get("importe"), d.get("moneda") or moneda),
+                    "Moneda": (d.get("moneda") or moneda),
+                    "Periodo": per.get("tipo"),
+                    "Año": per.get("anyo"),
+                    "Duración (meses)": per.get("duracion_meses"),
+                    "Observaciones": d.get("observaciones"),
+                })
+            df = pd.DataFrame(rows)
+            # Totales por año
+            if "Año" in df.columns and "Importe" in df.columns:
+                tot = df.groupby("Año", dropna=False)["Importe"].sum().reset_index()
+                tot["Total (fmt)"] = tot["Importe"].apply(lambda x: fmt_money(x, moneda))
+                st.markdown("**Totales por año**")
+                st.dataframe(tot[["Año","Total (fmt)"]], use_container_width=True, hide_index=True)
+            # Mostrar tabla formateada
+            st.markdown("**Detalle de importes**")
+            show_df = df.drop(columns=["Importe"], errors="ignore")
+            st.dataframe(show_df, use_container_width=True, hide_index=True)
+        except Exception:
+            for d in det:
+                st.markdown(f"- **{d.get('concepto')}** — {d}")
+    used = {"importe_total","moneda","iva_incluido","tipo_iva","importes_detalle"}
+    render_extra_fields("Detalles adicionales (importe)", im, used)
+# Criterios de valoración
+
             cv_all = fs_sections.get("criterios_valoracion", {})
             with st.expander("📊 Criterios de valoración"):
                 cv = cv_all.get("criterios_valoracion") or []
@@ -344,6 +431,8 @@ def main():
                         st.markdown(bullets(dmp))
                 else:
                     st.info("No se encontraron criterios explícitos.")
+            used = {'criterios_valoracion','criterios_desempate'}
+            render_extra_fields('Detalles adicionales (criterios)', cv_all, used)
 
             # Índice técnico
             it = fs_sections.get("indice_tecnico", {})
@@ -404,6 +493,8 @@ def main():
                         st.dataframe(pd.DataFrame(mrx), use_container_width=True, hide_index=True)
                     except Exception:
                         for r in mrx: st.markdown(f"- {r}")
+        used = {'riesgos_y_dudas','exclusiones','matriz_riesgos'}
+        render_extra_fields('Detalles adicionales (riesgos/exclusiones)', rx, used)
 
             # Solvencia
             solv = fs_sections.get("solvencia", {}).get("solvencia", {})
@@ -423,6 +514,8 @@ def main():
                         st.dataframe(pd.DataFrame(acr), use_container_width=True, hide_index=True)
                     except Exception:
                         for a in acr: st.markdown(f"- {a}")
+        used = {'solvencia'}
+        render_extra_fields('Detalles adicionales (solvencia)', fs_sections.get('solvencia', {}), used)
         else:
             st.info("Realiza un análisis para ver resultados.")
 
