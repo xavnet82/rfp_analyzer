@@ -369,8 +369,10 @@ SECTION_SPECS = {
     "indice_tecnico": {
         "titulo": "Índice de la respuesta técnica",
         "user_prompt": (
-            "1) Extrae el ÍNDICE SOLICITADO literal del pliego. "
-            "2) Propón un ÍNDICE ALINEADO (títulos claros, 1-2 líneas de descripción, subapartados concretos). "
+            "Tarea:\n"
+            "1) Extrae el ÍNDICE SOLICITADO literal del pliego (si existe).\n"
+            "2) Si no existe literal, propón un ÍNDICE ALINEADO con los objetivos, alcance, servicios y criterios de valoración que se desprenden del pliego.\n"
+            "3) La propuesta debe ser concreta y utilizable: títulos claros, 1-2 líneas de descripción por apartado y subapartados accionables.\n\n"
             "Devuelve SOLO JSON:\n"
             "{\n"
             '  "indice_respuesta_tecnica": [\n'
@@ -379,30 +381,35 @@ SECTION_SPECS = {
             '  "indice_propuesto": [\n'
             '    {"titulo": str, "descripcion": str|null, "subapartados": [str]}\n'
             '  ],\n'
-            '  "trazabilidad": [                          // opcional: mapea propuesto→solicitado\n'
+            '  "trazabilidad": [                          // mapea cada propuesto→solicitado o null si no aplica\n'
             '    {"propuesto": str, "solicitado_match": str|null}\n'
             '  ],\n'
             '  "referencias_paginas": [int],\n'
             '  "evidencias": [{"pagina": int, "cita": str}],\n'
             '  "discrepancias": [str]\n'
             "}\n"
-            "Reglas: el índice propuesto debe cubrir lo solicitado; evita ruido y redundancias; "
-            "si el pliego no define índice, indícalo y propone uno compacto y justificable."
+            "Reglas:\n"
+            "- Si no hay índice literal, pon [] en 'indice_respuesta_tecnica' pero SIEMPRE rellena 'indice_propuesto'.\n"
+            "- Sé conciso y específico; evita títulos vacíos o genéricos.\n"
+            "- Incluye referencias de página y 1-3 citas cortas si existen fuentes explícitas.\n"
         ),
     },
     "riesgos_exclusiones": {
         "titulo": "Riesgos y exclusiones",
         "user_prompt": (
-            "Identifica RIESGOS (contractuales, técnicos/operativos, plazos, dependencias) y EXCLUSIONES. "
+            "Identifica RIESGOS (contractuales, técnicos/operativos, plazos, dependencias) y EXCLUSIONES.\n"
+            "Si el pliego no los enumera explícitamente, infiere riesgos plausibles basados en objetivos, alcance, servicios, criterios y condiciones contractuales del propio pliego.\n"
             "Devuelve SOLO JSON:\n"
             "{\n"
             '  "riesgos_y_dudas": str|null,               // síntesis de 3-6 frases\n'
-            '  "exclusiones": [str],                      // literal o parafraseado fiel\n'
+            '  "exclusiones": [str],                      // literal si existen; si no, []\n'
             '  "referencias_paginas": [int],\n'
             '  "evidencias": [{"pagina": int, "cita": str}],\n'
             '  "discrepancias": [str]\n'
             "}\n"
-            "Reglas: no inventes; si no hay exclusiones explícitas, devuelve []."
+            "Reglas:\n"
+            "- No inventes datos fuera del pliego; si infieres, debe ser compatible con lo que el pliego sí establece (menciona la base).\n"
+            "- Prioriza precisión factual > concisión > completitud.\n"
         ),
     },
     "solvencia": {
@@ -431,38 +438,38 @@ SECTION_SPECS = {
 # ---------------------------------------------------------------------
 # Selección de páginas relevantes por sección (acelera local)
 # ---------------------------------------------------------------------
-SECTION_KEYWORDS = {
-    "objetivos_contexto": {
-        "objeto del contrato": 5, "objeto": 3, "alcance": 3, "objetivo": 3,
-        "contexto": 2, "descripción del servicio": 3, "alcances": 3,
-    },
-    "servicios": {
-        "servicios": 4, "descripción del servicio": 4, "alcance": 3,
-        "actividades": 3, "tareas": 3, "entregables": 3, "sla": 2,
-    },
-    "importe": {
-        "presupuesto base": 6, "importe": 5, "precio": 4, "iva": 4,
-        "base imponible": 4, "prórroga": 3, "anualidad": 3, "licitación": 4,
-    },
-    "criterios_valoracion": {
-        "criterios de valoración": 6, "criterios de adjudicación": 6,
-        "baremo": 5, "puntuación": 5, "puntos": 4, "peso": 4, "subcriterios": 3,
-    },
+SECTION_KEYWORDS.update({
     "indice_tecnico": {
-        "índice": 5, "estructura": 4, "contenido de la oferta": 5,
-        "memoria técnica": 4, "apartados": 3, "secciones": 3,
+        "índice": 6, "indice": 6, "estructura": 5, "estructura mínima": 6,
+        "contenido de la oferta": 6, "contenido mínimo": 6, "memoria técnica": 5,
+        "documentación técnica": 5, "apartados": 4, "secciones": 4,
+        "instrucciones de preparación": 5, "formato de la propuesta": 5,
+        "orden de contenidos": 5, "capítulos": 4, "anexos": 3,
+        "presentación de ofertas": 4, "sobre técnico": 5
     },
     "riesgos_exclusiones": {
-        "exclusiones": 6, "quedan excluidos": 6, "no incluye": 5,
-        "riesgos": 4, "limitaciones": 4, "no serán objeto": 5,
+        "exclusiones": 7, "no incluye": 7, "quedan excluidos": 7,
+        "no serán objeto": 6, "limitaciones": 5, "incompatibilidades": 5,
+        "responsabilidad": 4, "exenciones": 4, "penalizaciones": 4,
+        "causas de exclusión": 6, "supuestos de exclusión": 6,
+        "condiciones especiales": 4, "garantías": 4, "plazos": 4,
+        "régimen sancionador": 5, "riesgos": 4, "restricciones": 4
     },
-    "solvencia": {
-        "solvencia técnica": 6, "solvencia económica": 6, "solvencia financiera": 5,
-        "requisitos de solvencia": 6, "clasificación": 4, "experiencia": 3,
-        "medios personales": 3, "medios materiales": 3,
-    },
+})
+
+SECTION_CONTEXT_TUNING = {
+    # max chars por doc y ventana de páginas para _select_relevant_spans
+    "indice_tecnico": {"max_chars": 80000, "window": 2},
+    "riesgos_exclusiones": {"max_chars": 60000, "window": 2},
 }
 
+def _select_relevant_spans(pages: List[str], section_key: str,
+                           max_chars: int = LOCAL_CONTEXT_MAX_CHARS, window: int = 1) -> str:
+    # override si hay tuning específico
+    tune = SECTION_CONTEXT_TUNING.get(section_key, {})
+    max_chars = tune.get("max_chars", max_chars)
+    window    = tune.get("window", window)
+    # ... (resto de la función sin cambios)
 
 def _score_page(text: str, weights: dict) -> int:
     if not text:
