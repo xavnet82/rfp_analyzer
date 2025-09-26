@@ -41,6 +41,8 @@ def main():
         st.header("Configuración")
         # Selector de modelo
         options = MODELS_CATALOG + ["Otro…"]
+        modo = st.radio("Modo de análisis", ["Chunking local", "PDF completo (File Search)"], index=0,
+                help="File Search sube el PDF a OpenAI y lo reutiliza en varias preguntas sin reenviar texto.")
         try:
             default_index = options.index(OPENAI_MODEL) if OPENAI_MODEL in options else 0
         except Exception:
@@ -83,30 +85,49 @@ def main():
     st.success(f"Se han leído {len(docs)} fichero(s). Total páginas: {sum(d['num_pages'] for d in docs)}; total chunks: {total_chunks}.")
 
     if st.button("Analizar con OpenAI", type="primary"):
-        aggregate_result = None
-        per_file_results = {}
-        prog = st.progress(0.0)
-        status = st.empty()
-        processed = 0
-
-        for d in docs:
-            status.info(f"Analizando: {d['name']} ({len(d['chunks'])} chunks)...")
-            result = None
-            for ch_idx, ch in enumerate(d["chunks"], start=1):
-                try:
-                    result = analyze_text_chunk(result, ch, model=model, temperature=temperature)
-                except Exception as e:
-                    st.error(f"Error analizando **{d['name']}**, chunk {ch_idx}/{len(d['chunks'])}: {e}")
-                    raise
-                processed += 1
-                prog.progress(processed / max(total_chunks, 1))
-            per_file_results[d["name"]] = result
-            aggregate_result = result if aggregate_result is None else merge_offers(aggregate_result, result)
-
-        status.success("Análisis completado.")
-        st.session_state["per_file_results"] = per_file_results
-        st.session_state["aggregate_result"] = aggregate_result
-
+        if modo == "Chunking local":
+            aggregate_result = None
+            per_file_results = {}
+            prog = st.progress(0.0)
+            status = st.empty()
+            processed = 0
+    
+            for d in docs:
+                status.info(f"Analizando: {d['name']} ({len(d['chunks'])} chunks)...")
+                result = None
+                for ch_idx, ch in enumerate(d["chunks"], start=1):
+                    try:
+                        result = analyze_text_chunk(result, ch, model=model, temperature=temperature)
+                    except Exception as e:
+                        st.error(f"Error analizando **{d['name']}**, chunk {ch_idx}/{len(d['chunks'])}: {e}")
+                        raise
+                    processed += 1
+                    prog.progress(processed / max(total_chunks, 1))
+                per_file_results[d["name"]] = result
+                aggregate_result = result if aggregate_result is None else merge_offers(aggregate_result, result)
+    
+            status.success("Análisis completado.")
+            st.session_state["per_file_results"] = per_file_results
+            st.session_state["aggregate_result"] = aggregate_result
+         pass
+            else:
+                # --- NUEVO: PDF completo ---
+                from services.file_search_client import create_vector_store_from_streamlit_files, analyze_with_file_search
+                vs_id = create_vector_store_from_streamlit_files(files, name="RFP Vector Store")
+                st.info("PDF(s) indexados en OpenAI. Ejecutando análisis…")
+        
+                # 1 llamada para obtener TODO el JSON estructurado
+                raw = analyze_with_file_search(vector_store_id=vs_id, model=model, temperature=temperature)
+        
+                # Reutiliza tu parser + esquema existentes
+                import json
+                from services.schema import OfertaAnalizada
+                data = json.loads(raw)
+                result = OfertaAnalizada.model_validate(data)
+        
+                st.session_state["per_file_results"] = {"(vector_store)": result}
+                st.session_state["aggregate_result"] = result
+                st.success("Análisis completado con File Search.")
     per_file_results = st.session_state.get("per_file_results", {})
     aggregate_result = st.session_state.get("aggregate_result", None)
 
