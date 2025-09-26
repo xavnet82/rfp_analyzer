@@ -1,46 +1,72 @@
 # app.py
-import os, sys, io, json, re
-from typing import Optional, Dict, Any, List
+# ---------------------------------------------------------------------
+# RFP Analyzer – Streamlit
+#  - Modelos visibles: gpt-4o y gpt-4o-mini
+#  - Temperatura fija = 0.2 (no editable)
+#  - Modo principal: PDF completo con File Search; si no hay soporte o no hay señal → fallback local rápido (una llamada por sección)
+#  - Botones event-driven (sin duplicados visuales); "Análisis Completo" ejecuta secciones en paralelo y compone una vista completa (segunda pestaña)
+#  - Cacheo de parseo PDF y selección de páginas relevantes por sección (keyword scoring) para acelerar
+# ---------------------------------------------------------------------
 
-# Asegura que la raíz del proyecto está en el path de importación
-ROOT = os.path.dirname(__file__)
-if ROOT not in sys.path:
-    sys.path.insert(0, ROOT)
+import os
+import sys
+import io
+import json
+import re
+import hashlib
+from typing import Optional, Dict, Any, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 from openai import OpenAI, BadRequestError
 
-from config import (
-    APP_TITLE,
-    OPENAI_MODEL,
-    OPENAI_API_KEY,
-    OPENAI_TEMPERATURE,   # no se usará en UI; temperatura fija 0.2
-    MODELS_CATALOG,       # no se usará; dejamos import por compatibilidad
-    ADMIN_USER,
-    ADMIN_PASSWORD,
-    MAX_TOKENS_PER_REQUEST,
-)
+# ---------------------------------------------------------------------
+# Imports de la app (se asume que existen en tu repo)
+# ---------------------------------------------------------------------
+try:
+    from config import (
+        APP_TITLE,
+        OPENAI_MODEL,
+        OPENAI_API_KEY,
+        ADMIN_USER,
+        ADMIN_PASSWORD,
+        MAX_TOKENS_PER_REQUEST,
+    )
+except Exception as e:
+    st.error(f"Falta o no es importable `config.py`: {e}")
+    st.stop()
 
-# Servicios locales ya existentes
-from services.pdf_loader import extract_pdf_text
-from services.schema import OfertaAnalizada
-from services.openai_client import analyze_text_chunk, merge_offers
-from utils.text import clean_text, chunk_text
-from components.ui import render_header
+try:
+    from components.ui import render_header
+except Exception:
+    # Fallback mínimo si no existiera el componente
+    def render_header(title: str):
+        st.title(title)
+
+try:
+    from services.pdf_loader import extract_pdf_text
+except Exception as e:
+    st.error(f"No se pudo importar services.pdf_loader.extract_pdf_text: {e}")
+    st.stop()
+
+try:
+    from utils.text import clean_text
+except Exception as e:
+    st.error(f"No se pudo importar utils.text.clean_text: {e}")
+    st.stop()
 
 # ---------------------------------------------------------------------
 # Parámetros de esta versión
 # ---------------------------------------------------------------------
 AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini"]
 FIXED_TEMPERATURE = 0.2
-CHUNK_MAX_CHARS_DEFAULT = 12_000  # usado en fallback map-reduce
+LOCAL_CONTEXT_MAX_CHARS = 40_000       # por documento para la selección de páginas
 SECOND_TAB_KEY = "full_view_ready"
 
-
 # ---------------------------------------------------------------------
-# Página
+# Página / Tema
 # ---------------------------------------------------------------------
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.set_page_config(page_title="RFP Analyzer", layout="wide")
 
 
 # ---------------------------------------------------------------------
@@ -79,17 +105,20 @@ if not OPENAI_API_KEY:
 
 _oai_client = OpenAI(api_key=OPENAI_API_KEY)
 
+
 def _strip_code_fences(s: str) -> str:
     s = s.strip()
     s = re.sub(r'^\s*```(?:json)?\s*', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\s*```\s*$', '', s)
     return s
 
+
 def _extract_json_block(text: str) -> str:
     m = re.search(r"\{[\s\S]*\}", text)
     if not m:
         raise RuntimeError("La respuesta del modelo no contiene JSON parseable.")
     return m.group(0)
+
 
 def _json_loads_robust(raw: Any) -> Any:
     if raw is None:
@@ -105,10 +134,13 @@ def _json_loads_robust(raw: Any) -> Any:
         brace = _extract_json_block(s)
         return json.loads(brace)
 
+
 def _coalesce_text_from_responses(rsp) -> Optional[str]:
+    # SDK moderno
     txt = getattr(rsp, "output_text", None)
     if txt:
         return txt
+    # Compat: explorar estructura
     out = getattr(rsp, "output", None)
     if out:
         parts = []
@@ -140,13 +172,19 @@ def _coalesce_text_from_responses(rsp) -> Optional[str]:
             return "\n".join(parts)
     return None
 
+
 def _is_temperature_error(e: Exception) -> bool:
     s = str(e)
     return ("temperature" in s) and ("Unsupported value" in s or "unsupported_value" in s or "does not support" in s)
 
+
 def _is_unsupported_param(e: Exception, param: str) -> bool:
     s = str(e)
-    return ("unsupported_parameter" in s or "Unexpected" in s or "unexpected" in s or "Unknown parameter" in s) and (param in s)
+    return (
+        ("unsupported_parameter" in s or "Unexpected" in s or "unexpected" in s or "Unknown parameter" in s)
+        and (param in s)
+    )
+
 
 def _responses_create_robust(args: dict):
     """
@@ -159,7 +197,7 @@ def _responses_create_robust(args: dict):
     a = dict(args)
     extra = a.pop("extra_body", {}) or {}
 
-    for _ in range(6):
+    for _ in range(4):
         try:
             if extra:
                 return _oai_client.responses.create(**a, extra_body=extra)
@@ -169,24 +207,29 @@ def _responses_create_robust(args: dict):
             s = str(e)
 
             if _is_temperature_error(e) or ("unexpected keyword" in s and "temperature" in s):
-                a.pop("temperature", None); continue
+                a.pop("temperature", None)
+                continue
 
             if _is_unsupported_param(e, "response_format") or ("unexpected keyword" in s and "response_format" in s):
-                a.pop("response_format", None); continue
+                a.pop("response_format", None)
+                continue
 
             if _is_unsupported_param(e, "max_output_tokens") or ("unexpected keyword" in s and "max_output_tokens" in s):
                 val = a.pop("max_output_tokens", None)
-                if val is not None: a["max_completion_tokens"] = val
+                if val is not None:
+                    a["max_completion_tokens"] = val
                 continue
 
             if _is_unsupported_param(e, "attachments") or ("unexpected keyword" in s and "attachments" in s):
                 att = a.pop("attachments", None)
-                if att is not None: extra["attachments"] = att
+                if att is not None:
+                    extra["attachments"] = att
                 continue
 
             if _is_unsupported_param(e, "tools") or ("unexpected keyword" in s and "tools" in s):
                 tools = a.pop("tools", None)
-                if tools is not None: extra["tools"] = tools
+                if tools is not None:
+                    extra["tools"] = tools
                 continue
 
             raise
@@ -195,7 +238,7 @@ def _responses_create_robust(args: dict):
 def create_vector_store_from_streamlit_files(files, name: str = "RFP Vector Store"):
     """
     Sube los PDFs a OpenAI, los indexa en un Vector Store y
-    devuelve (vector_store_id, file_ids) para fallback con 'attachments'.
+    devuelve (vector_store_id, file_ids) para uso con 'attachments'.
     """
     store = _oai_client.vector_stores.create(
         name=name,
@@ -217,7 +260,7 @@ def create_vector_store_from_streamlit_files(files, name: str = "RFP Vector Stor
 
 
 # ---------------------------------------------------------------------
-# Secciones (prompts para File Search / Map-Reduce)
+# Secciones (prompts para File Search / Local)
 # ---------------------------------------------------------------------
 SECTION_SPECS: Dict[str, Dict[str, str]] = {
     "objetivos_contexto": {
@@ -317,7 +360,93 @@ SYSTEM_PREFIX = (
     "Si algo no aparece en los PDFs, devuelve null o listas vacías."
 )
 
-# ---------------- Conversión a JSON forzada (segunda llamada) ----------------
+# ---------------------------------------------------------------------
+# Selección de páginas relevantes por sección (acelera local)
+# ---------------------------------------------------------------------
+SECTION_KEYWORDS = {
+    "objetivos_contexto": {
+        "objeto del contrato": 5, "objeto": 3, "alcance": 3, "objetivo": 3,
+        "contexto": 2, "descripción del servicio": 3, "alcances": 3,
+    },
+    "servicios": {
+        "servicios": 4, "descripción del servicio": 4, "alcance": 3,
+        "actividades": 3, "tareas": 3, "entregables": 3, "sla": 2,
+    },
+    "importe": {
+        "presupuesto base": 6, "importe": 5, "precio": 4, "iva": 4,
+        "base imponible": 4, "prórroga": 3, "anualidad": 3, "licitación": 4,
+    },
+    "criterios_valoracion": {
+        "criterios de valoración": 6, "criterios de adjudicación": 6,
+        "baremo": 5, "puntuación": 5, "puntos": 4, "peso": 4, "subcriterios": 3,
+    },
+    "indice_tecnico": {
+        "índice": 5, "estructura": 4, "contenido de la oferta": 5,
+        "memoria técnica": 4, "apartados": 3, "secciones": 3,
+    },
+    "riesgos_exclusiones": {
+        "exclusiones": 6, "quedan excluidos": 6, "no incluye": 5,
+        "riesgos": 4, "limitaciones": 4, "no serán objeto": 5,
+    },
+    "solvencia": {
+        "solvencia técnica": 6, "solvencia económica": 6, "solvencia financiera": 5,
+        "requisitos de solvencia": 6, "clasificación": 4, "experiencia": 3,
+        "medios personales": 3, "medios materiales": 3,
+    },
+}
+
+
+def _score_page(text: str, weights: dict) -> int:
+    if not text:
+        return 0
+    t = text.lower()
+    s = 0
+    for kw, w in weights.items():
+        s += t.count(kw) * w
+    return s
+
+
+def _select_relevant_spans(pages: List[str], section_key: str,
+                           max_chars: int = LOCAL_CONTEXT_MAX_CHARS, window: int = 1) -> str:
+    weights = SECTION_KEYWORDS.get(section_key, {})
+    scored = [(_score_page(p, weights), i) for i, p in enumerate(pages)]
+    scored.sort(reverse=True)  # mayor puntuación primero
+
+    selected, total, used = [], 0, set()
+    for sc, i in scored:
+        if sc <= 0:
+            break
+        # añadimos ventana alrededor de la página candidata
+        for j in range(max(0, i - window), min(len(pages), i + window + 1)):
+            if j in used:
+                continue
+            txt = pages[j]
+            if not txt:
+                continue
+            if total + len(txt) > max_chars:
+                break
+            selected.append(f"[Pág {j+1}]\n{txt}")
+            used.add(j)
+            total += len(txt)
+        if total >= max_chars:
+            break
+
+    # Si no hubo hits, coge primeras páginas como contexto de “arranque”
+    if not selected:
+        for j, txt in enumerate(pages[:3]):
+            if not txt:
+                continue
+            selected.append(f"[Pág {j+1}]\n{txt}")
+            total += len(txt)
+            if total >= max_chars:
+                break
+
+    return "\n\n".join(selected)
+
+
+# ---------------------------------------------------------------------
+# File Search (Responses) – llamada con adjuntos
+# ---------------------------------------------------------------------
 def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: str, temperature: Optional[float]):
     schema_hint = ""
     if section_key and section_key in SECTION_SPECS:
@@ -344,10 +473,8 @@ def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: s
         input=[sys_msg, usr_msg],
         response_format={"type": "json_object"},
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
+        temperature=float(temperature) if temperature is not None else None,
     )
-    if temperature is not None:
-        args["temperature"] = float(temperature)
-
     rsp = _responses_create_robust(args)
     text = _coalesce_text_from_responses(rsp)
     if not text:
@@ -357,7 +484,7 @@ def _force_jsonify_from_text(section_key: Optional[str], raw_text: str, model: s
 
 
 def _file_search_section_call(
-    vector_store_id: str,                 # no usado aquí, se mantiene por compatibilidad
+    vector_store_id: str,                 # no usado directamente (compat)
     user_prompt: str,
     model: str,
     temperature: Optional[float] = None,
@@ -381,10 +508,8 @@ def _file_search_section_call(
         attachments=[{"file_id": fid, "tools": [{"type": "file_search"}]} for fid in file_ids],
         response_format={"type": "json_object"},
         max_output_tokens=MAX_TOKENS_PER_REQUEST,
+        temperature=float(temperature) if temperature is not None else None,
     )
-    if temperature is not None:
-        args["temperature"] = float(temperature)
-
     rsp = _responses_create_robust(args)
     text = _coalesce_text_from_responses(rsp)
 
@@ -403,118 +528,55 @@ def _file_search_section_call(
 
 
 # ---------------------------------------------------------------------
-# Fallback local: Map-Reduce por sección
+# Fallback local rápido: UNA llamada por sección
 # ---------------------------------------------------------------------
-def analyze_chunk_safe(current_result, ch_text, model, temperature):
-    try:
-        return analyze_text_chunk(current_result, ch_text, model=model, temperature=temperature)
-    except TypeError:
-        return analyze_text_chunk(current_result, ch_text, model=model)
-
-def _merge_section_payload(section_key: str, acc: Dict[str, Any], part: Dict[str, Any]) -> Dict[str, Any]:
-    if section_key == "objetivos_contexto":
-        acc["resumen_servicios"] = max([acc.get("resumen_servicios"), part.get("resumen_servicios")], key=lambda x: len(x or ""), default=None)
-        acc["alcance"] = max([acc.get("alcance"), part.get("alcance")], key=lambda x: len(x or ""), default=None)
-        acc["objetivos"] = list({*(acc.get("objetivos") or []), * (part.get("objetivos") or [])})
-        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
-        return acc
-    if section_key == "servicios":
-        acc["resumen_servicios"] = max([acc.get("resumen_servicios"), part.get("resumen_servicios")], key=lambda x: len(x or ""), default=None)
-        acc["alcance"] = max([acc.get("alcance"), part.get("alcance")], key=lambda x: len(x or ""), default=None)
-        acc["servicios_detalle"] = (acc.get("servicios_detalle") or []) + (part.get("servicios_detalle") or [])
-        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
-        return acc
-    if section_key == "importe":
-        acc["importe_total"] = acc.get("importe_total") or part.get("importe_total")
-        acc["moneda"] = acc.get("moneda") or part.get("moneda")
-        acc["importes_detalle"] = (acc.get("importes_detalle") or []) + (part.get("importes_detalle") or [])
-        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
-        return acc
-    if section_key == "criterios_valoracion":
-        acc["criterios_valoracion"] = (acc.get("criterios_valoracion") or []) + (part.get("criterios_valoracion") or [])
-        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
-        return acc
-    if section_key == "indice_tecnico":
-        acc["indice_respuesta_tecnica"] = (acc.get("indice_respuesta_tecnica") or []) + (part.get("indice_respuesta_tecnica") or [])
-        acc["indice_propuesto"] = (acc.get("indice_propuesto") or []) + (part.get("indice_propuesto") or [])
-        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
-        return acc
-    if section_key == "riesgos_exclusiones":
-        acc["riesgos_y_dudas"] = max([acc.get("riesgos_y_dudas"), part.get("riesgos_y_dudas")], key=lambda x: len(x or ""), default=None)
-        acc["exclusiones"] = list({*(acc.get("exclusiones") or []), * (part.get("exclusiones") or [])})
-        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
-        return acc
-    if section_key == "solvencia":
-        sv = acc.get("solvencia") or {"tecnica": [], "economica": [], "administrativa": []}
-        part_sv = part.get("solvencia") or {"tecnica": [], "economica": [], "administrativa": []}
-        sv["tecnica"] = list({*sv.get("tecnica", []), *part_sv.get("tecnica", [])})
-        sv["economica"] = list({*sv.get("economica", []), *part_sv.get("economica", [])})
-        sv["administrativa"] = list({*sv.get("administrativa", []), *part_sv.get("administrativa", [])})
-        acc["solvencia"] = sv
-        acc["referencias_paginas"] = sorted(set([*(acc.get("referencias_paginas") or []), * (part.get("referencias_paginas") or [])]))
-        return acc
-    return acc
-
-def _empty_payload_for_section(section_key: str) -> Dict[str, Any]:
-    if section_key == "objetivos_contexto":
-        return {"resumen_servicios": None, "objetivos": [], "alcance": None, "referencias_paginas": []}
-    if section_key == "servicios":
-        return {"resumen_servicios": None, "servicios_detalle": [], "alcance": None, "referencias_paginas": []}
-    if section_key == "importe":
-        return {"importe_total": None, "moneda": None, "importes_detalle": [], "referencias_paginas": []}
-    if section_key == "criterios_valoracion":
-        return {"criterios_valoracion": [], "referencias_paginas": []}
-    if section_key == "indice_tecnico":
-        return {"indice_respuesta_tecnica": [], "indice_propuesto": [], "referencias_paginas": []}
-    if section_key == "riesgos_exclusiones":
-        return {"riesgos_y_dudas": None, "exclusiones": [], "referencias_paginas": []}
-    if section_key == "solvencia":
-        return {"solvencia": {"tecnica": [], "economica": [], "administrativa": []}, "referencias_paginas": []}
-    return {}
-
-def _local_map_reduce_section(section_key: str, model: str, temperature: float, max_chars: int):
+def _local_singlecall_section(section_key: str, model: str, temperature: float, max_chars: int):
     docs = st.session_state.get("fs_local_docs", [])
     if not docs:
         raise RuntimeError("No hay texto local para fallback. Reindexa los PDFs.")
-    all_chunks: List[str] = []
+
+    # Construye contexto con solo páginas relevantes de cada documento
+    contexts = []
     for d in docs:
-        all_chunks.extend(chunk_text(d["pages"], max_chars=max_chars))
+        sel = _select_relevant_spans(d["pages"], section_key, max_chars=max_chars)
+        if sel:
+            contexts.append(sel)
+    context = "\n\n".join(contexts)[:120_000]  # tapón de seguridad
 
     sys_msg = {"role": "system", "content": [{"type": "input_text", "text": (
         "Eres un analista experto en licitaciones públicas en España. "
-        "Devuelve SIEMPRE JSON válido. Si el fragmento no contiene la información, devuelve campos vacíos/null."
+        "Devuelve SIEMPRE JSON válido (sin texto adicional). "
+        "Si el contexto no contiene la información, usa null/listas vacías."
     )}]}
     schema_hint = SECTION_SPECS[section_key]["user_prompt"]
-    acc = _empty_payload_for_section(section_key)
-
-    for ch in all_chunks:
-        usr = {"role": "user", "content": [{
-            "type": "input_text",
-            "text": (
-                f"Extrae SOLO la sección solicitada según este esquema (JSON):\n{schema_hint}\n\n"
-                "Texto del pliego (fragmento):\n<<<\n" + ch[:15000] + "\n>>>\n"
-                "Responde únicamente con JSON válido UTF-8."
-            )
-        }]}
-        args = dict(
-            model=(model or OPENAI_MODEL).strip(),
-            input=[sys_msg, usr],
-            response_format={"type": "json_object"},
-            max_output_tokens=MAX_TOKENS_PER_REQUEST,
-            temperature=float(temperature),
+    usr = {"role": "user", "content": [{
+        "type": "input_text",
+        "text": (
+            f"Extrae SOLO la sección solicitada según este esquema (JSON):\n{schema_hint}\n\n"
+            "Usa EXCLUSIVAMENTE el siguiente contexto (fragmentos del pliego):\n<<<\n"
+            + context + "\n>>>\n"
+            "Responde únicamente con JSON válido UTF-8."
         )
-        try:
-            rsp = _responses_create_robust(args)
-            text = _coalesce_text_from_responses(rsp)
-            if not text:
-                text = _extract_json_block(json.dumps(rsp, default=str))
-            part = _json_loads_robust(text)
-        except Exception:
-            part = _empty_payload_for_section(section_key)
-        acc = _merge_section_payload(section_key, acc, part)
-    return acc
+    }]}
 
-def _run_section_with_fallback(section_key: str, vs_id: str, file_ids: List[str], model: str, temperature: float, max_chars: int):
+    args = dict(
+        model=(model or OPENAI_MODEL).strip(),
+        input=[sys_msg, usr],
+        response_format={"type": "json_object"},
+        max_output_tokens=MAX_TOKENS_PER_REQUEST,
+        temperature=float(temperature),
+    )
+
+    rsp = _responses_create_robust(args)
+    text = _coalesce_text_from_responses(rsp)
+    if not text:
+        text = _extract_json_block(json.dumps(rsp, default=str))
+    return _json_loads_robust(text)
+
+
+def _run_section_with_fallback(section_key: str, vs_id: str, file_ids: List[str],
+                               model: str, temperature: float, max_chars: int):
+    # 1º intento: File Search
     try:
         data = _file_search_section_call(
             vector_store_id=vs_id,
@@ -524,13 +586,31 @@ def _run_section_with_fallback(section_key: str, vs_id: str, file_ids: List[str]
             file_ids=file_ids,
             section_key=section_key,
         )
-        # vacío → forzamos fallback
         if not data or all((v in (None, [], {}) for v in data.values())):
             raise RuntimeError("File Search devolvió JSON vacío.")
         return data, "file_search"
     except Exception:
-        data = _local_map_reduce_section(section_key, model=model, temperature=temperature, max_chars=max_chars)
-        return data, "local_map_reduce"
+        # 2º intento: local rápido con UNA llamada
+        data = _local_singlecall_section(section_key, model=model,
+                                         temperature=temperature, max_chars=max_chars)
+        return data, "local_single"
+
+
+# ---------------------------------------------------------------------
+# Cacheo de parseo PDF
+# ---------------------------------------------------------------------
+def _sha256(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+@st.cache_data(show_spinner=False)
+def parse_pdf_cached(name: str, content_bytes: bytes):
+    # Cachea por hash de bytes para no reprocesar un PDF idéntico
+    h = _sha256(content_bytes)
+    pages, _ = extract_pdf_text(io.BytesIO(content_bytes))
+    pages = [clean_text(p) for p in pages]
+    total_chars = sum(len(p or "") for p in pages)
+    return {"name": name, "pages": pages, "total_chars": total_chars, "hash": h}
 
 
 # ---------------------------------------------------------------------
@@ -546,7 +626,6 @@ def sidebar_config():
             default_idx = 0
         model = st.selectbox("Modelo OpenAI", options=AVAILABLE_MODELS, index=default_idx)
         st.caption("Temperatura fija: 0.2")
-    # Devolvemos temperatura fija y sin modo (solo File Search)
     return model, FIXED_TEMPERATURE
 
 
@@ -557,19 +636,12 @@ def render_full_view(fs_sections: Dict[str, Any]):
     st.markdown("### Vista completa del análisis")
     # Métricas principales
     c1, c2, c3 = st.columns(3)
-    # Objetivos/Resumen
     oc = fs_sections.get("objetivos_contexto", {})
-    resumen = oc.get("resumen_servicios") or "—"
     objetivos = oc.get("objetivos") or []
-    alcance = oc.get("alcance") or "—"
-
-    # Importe
     im = fs_sections.get("importe", {})
     imp_total = im.get("importe_total")
     moneda = im.get("moneda") or "€"
     imp_str = f"{imp_total:,.2f} {moneda}" if isinstance(imp_total, (int, float)) else "—"
-
-    # Solvencia
     sv = fs_sections.get("solvencia", {}).get("solvencia", {})
     solv_tec = len(sv.get("tecnica", []))
     solv_eco = len(sv.get("economica", []))
@@ -583,19 +655,20 @@ def render_full_view(fs_sections: Dict[str, Any]):
 
     # Sección Objetivos/Contexto
     with st.expander("🎯 Objetivos y contexto", expanded=True):
-        st.markdown(f"**Resumen de servicios**: {resumen}")
+        resumen = oc.get("resumen_servicios") or "—"
+        alcance = oc.get("alcance") or "—"
+        st.markdown(f"**Resumen de servicios:** {resumen}")
         if objetivos:
             st.markdown("**Objetivos**:")
             st.write("\n".join([f"- {o}" for o in objetivos]))
-        st.markdown(f"**Alcance**: {alcance}")
+        st.markdown(f"**Alcance:** {alcance}")
 
     # Servicios solicitados
     svs = fs_sections.get("servicios", {})
     with st.expander("🧩 Servicios solicitados (detalle)", expanded=False):
-        st.markdown(f"**Resumen**: {svs.get('resumen_servicios') or '—'}")
+        st.markdown(f"**Resumen:** {svs.get('resumen_servicios') or '—'}")
         detalle = svs.get("servicios_detalle") or []
         if detalle:
-            # tabla simple
             import pandas as pd
             df = pd.DataFrame([{"Servicio": d.get("nombre"), "Descripción": d.get("descripcion")} for d in detalle])
             st.dataframe(df, use_container_width=True, hide_index=True)
@@ -604,7 +677,7 @@ def render_full_view(fs_sections: Dict[str, Any]):
 
     # Importe y desglose
     with st.expander("💶 Importe de licitación", expanded=False):
-        st.markdown(f"**Importe total**: {imp_str}")
+        st.markdown(f"**Importe total:** {imp_str}")
         det = im.get("importes_detalle") or []
         if det:
             import pandas as pd
@@ -640,13 +713,13 @@ def render_full_view(fs_sections: Dict[str, Any]):
         with col1:
             st.markdown("**Índice solicitado**")
             if req:
-                st.write("\n".join([f"- {s.get('titulo')}" for s in req]))
+                st.write("\n".join([f"- {s.get('titulo')}" for s in req if s.get("titulo")]))
             else:
                 st.info("Sin índice solicitado detectado.")
         with col2:
             st.markdown("**Índice propuesto**")
             if prop:
-                st.write("\n".join([f"- {s.get('titulo')}" for s in prop]))
+                st.write("\n".join([f"- {s.get('titulo')}" for s in prop if s.get("titulo")]))
             else:
                 st.info("Sin índice propuesto.")
 
@@ -655,9 +728,9 @@ def render_full_view(fs_sections: Dict[str, Any]):
     with st.expander("⚠️ Riesgos y exclusiones", expanded=False):
         ry = rx.get("riesgos_y_dudas")
         ex = rx.get("exclusiones") or []
-        st.markdown(f"**Riesgos y dudas**: {ry or '—'}")
+        st.markdown(f"**Riesgos y dudas:** {ry or '—'}")
         if ex:
-            st.markdown("**Exclusiones**:")
+            st.markdown("**Exclusiones:**")
             st.write("\n".join([f"- {e}" for e in ex]))
 
     # Solvencia
@@ -699,15 +772,17 @@ def main():
         st.info("Sube al menos un PDF para comenzar el análisis.")
         st.stop()
 
-    # 5) Indexación en OpenAI + captura de texto local (para fallback/map-reduce)
+    # 5) Indexación en OpenAI + captura de texto local (cacheado)
     if "fs_vs_id" not in st.session_state or st.button("Reindexar PDFs en OpenAI"):
+        # Limpiar resultados previos
         st.session_state.pop("fs_sections", None)
         st.session_state.pop(SECOND_TAB_KEY, None)
 
         uploaded = [{"name": f.name, "bytes": f.read()} for f in files]
 
+        # crear objetos memfile para la API de OpenAI
         class _MemFile:
-            def __init__(self, name, data): self.name=name; self._data=data
+            def __init__(self, name, data): self.name = name; self._data = data
             def read(self): return self._data
 
         mem_files = [_MemFile(u["name"], u["bytes"]) for u in uploaded]
@@ -715,15 +790,13 @@ def main():
         with st.spinner("Indexando PDFs en OpenAI (Vector Store)..."):
             vs_id, file_ids = create_vector_store_from_streamlit_files(mem_files, name="RFP Vector Store")
 
-        # Texto local y diagnóstico
+        # Texto local cacheado y diagnóstico
         local_docs = []
         char_stats = []
         for u in uploaded:
-            pages, _ = extract_pdf_text(io.BytesIO(u["bytes"]))
-            pages = [clean_text(p) for p in pages]
-            local_docs.append({"name": u["name"], "pages": pages})
-            total_chars = sum(len(p or "") for p in pages)
-            char_stats.append((u["name"], len(pages), total_chars))
+            parsed = parse_pdf_cached(u["name"], u["bytes"])
+            local_docs.append({"name": u["name"], "pages": parsed["pages"]})
+            char_stats.append((u["name"], len(parsed["pages"]), parsed["total_chars"]))
 
         st.session_state["fs_vs_id"] = vs_id
         st.session_state["fs_file_ids"] = file_ids
@@ -739,36 +812,34 @@ def main():
         st.stop()
 
     # Diagnóstico de texto extraído
+    st.info(f"Vector Store listo: `{vs_id}` – {len(file_ids)} archivo(s) adjuntables")
     st.info("Texto extraído por PDF (diagnóstico):")
     for name, npages, nchar in st.session_state.get("char_stats", []):
         st.write(f"- **{name}**: {npages} páginas, {nchar} caracteres")
         if nchar < 1000:
             st.warning(f"{name}: muy poco texto extraído (posible PDF escaneado sin OCR).")
 
-    st.info(f"Vector Store listo: `{vs_id}` – {len(file_ids)} archivo(s) adjuntables")
-
-    # --- Estado de ejecución para evitar duplicados visuales ---
+    # 6) Estado de ejecución (para evitar duplicados visuales)
     st.session_state.setdefault("busy", False)
     st.session_state.setdefault("job", None)        # sección a ejecutar
     st.session_state.setdefault("job_all", False)   # ejecutar todas
-    
+
     def _start_job(section: str | None = None, do_all: bool = False):
         st.session_state["job"] = section
         st.session_state["job_all"] = do_all
         st.session_state["busy"] = True
-    
-    # 6) Pestañas de trabajo
+
+    # 7) Pestañas de trabajo
     tab1, tab2 = st.tabs(["Análisis por secciones", "Vista completa"])
 
     with tab1:
         st.subheader("Análisis por secciones")
-    
-        # Contenedor único para los controles (no se duplican)
+
         controls = st.container()
         with controls:
             c1, c2, c3 = st.columns(3)
             dis = st.session_state["busy"]
-    
+
             with c1:
                 st.button("Objetivos y contexto",   key="btn_obj",  use_container_width=True,
                           disabled=dis, on_click=_start_job, kwargs={"section": "objetivos_contexto"})
@@ -776,7 +847,7 @@ def main():
                           disabled=dis, on_click=_start_job, kwargs={"section": "servicios"})
                 st.button("Importe de licitación",  key="btn_imp",  use_container_width=True,
                           disabled=dis, on_click=_start_job, kwargs={"section": "importe"})
-    
+
             with c2:
                 st.button("Criterios de valoración", key="btn_crit", use_container_width=True,
                           disabled=dis, on_click=_start_job, kwargs={"section": "criterios_valoracion"})
@@ -784,32 +855,43 @@ def main():
                           disabled=dis, on_click=_start_job, kwargs={"section": "indice_tecnico"})
                 st.button("Riesgos y exclusiones",   key="btn_risk", use_container_width=True,
                           disabled=dis, on_click=_start_job, kwargs={"section": "riesgos_exclusiones"})
-    
+
             with c3:
                 st.button("Criterios de solvencia",  key="btn_solv", use_container_width=True,
                           disabled=dis, on_click=_start_job, kwargs={"section": "solvencia"})
                 st.write("")
                 st.button("🔎 Análisis Completo", type="primary", key="btn_all", use_container_width=True,
                           disabled=dis, on_click=_start_job, kwargs={"do_all": True})
-    
-        # Resultado/estado de ejecución: un único bloque controlado
+
+        # Ejecución controlada (sin duplicar UI)
         if st.session_state["busy"]:
             with st.status("Procesando análisis…", expanded=True) as status:
                 try:
                     if st.session_state["job_all"]:
                         order = list(SECTION_SPECS.keys())
-                        for k in order:
-                            data, mode_used = _run_section_with_fallback(
-                                section_key=k,
-                                vs_id=st.session_state["fs_vs_id"],
-                                file_ids=st.session_state["fs_file_ids"],
-                                model=model,
-                                temperature=temperature,
-                                max_chars=CHUNK_MAX_CHARS_DEFAULT,
-                            )
-                            st.session_state.setdefault("fs_sections", {})
-                            st.session_state["fs_sections"][k] = data
-                            status.write(f"✓ {SECTION_SPECS[k]['titulo']} ({'File Search' if mode_used=='file_search' else 'Local'})")
+                        results = {}
+                        max_workers = min(4, len(order))
+                        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                            futs = {
+                                ex.submit(
+                                    _run_section_with_fallback,
+                                    k,
+                                    st.session_state["fs_vs_id"],
+                                    st.session_state["fs_file_ids"],
+                                    model,
+                                    FIXED_TEMPERATURE,
+                                    LOCAL_CONTEXT_MAX_CHARS,
+                                ): k for k in order
+                            }
+                            done = 0
+                            for fut in as_completed(futs):
+                                k = futs[fut]
+                                data, mode_used = fut.result()
+                                st.session_state.setdefault("fs_sections", {})
+                                st.session_state["fs_sections"][k] = data
+                                done += 1
+                                status.write(f"✓ {SECTION_SPECS[k]['titulo']} ({'File Search' if mode_used=='file_search' else 'Local'}) [{done}/{len(order)}]")
+
                         st.session_state[SECOND_TAB_KEY] = True
                         status.update(label="Análisis completo finalizado", state="complete")
                     else:
@@ -821,8 +903,8 @@ def main():
                             vs_id=st.session_state["fs_vs_id"],
                             file_ids=st.session_state["fs_file_ids"],
                             model=model,
-                            temperature=temperature,
-                            max_chars=CHUNK_MAX_CHARS_DEFAULT,
+                            temperature=FIXED_TEMPERATURE,
+                            max_chars=LOCAL_CONTEXT_MAX_CHARS,
                         )
                         st.session_state.setdefault("fs_sections", {})
                         st.session_state["fs_sections"][k] = data
@@ -833,8 +915,8 @@ def main():
                     st.session_state["job"] = None
                     st.session_state["job_all"] = False
                     st.rerun()
-    
-        # Visualización de resultados por sección (solo si hay datos y no estamos ocupados)
+
+        # Visualización por sección
         st.subheader("Resultados por sección")
         if not st.session_state["busy"]:
             for key, spec in SECTION_SPECS.items():
@@ -848,7 +930,6 @@ def main():
                             mime="application/json",
                         )
 
-
     with tab2:
         fs_sections = st.session_state.get("fs_sections", {})
         if not fs_sections:
@@ -857,5 +938,6 @@ def main():
             render_full_view(fs_sections)
 
 
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
     main()
