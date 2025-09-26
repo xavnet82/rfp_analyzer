@@ -11,8 +11,7 @@ def chunk_text(pages: List[str], max_chars: int = 12000) -> List[str]:
     chunks, buf = [], ''
     for i, p in enumerate(pages, 1):
         if len(buf) + len(p) > max_chars and buf:
-            chunks.append(buf)
-            buf = p
+            chunks.append(buf); buf = p
         else:
             buf += ('\n\n' if buf else '') + p
     if buf:
