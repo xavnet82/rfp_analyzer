@@ -302,9 +302,10 @@ with col_title:
 with col_toggle:
     if "dark_mode" not in st.session_state:
         st.session_state["dark_mode"] = False
-    st.session_state["dark_mode"] = st.toggle("🌙 / ☀️", value=st.session_state["dark_mode"],
-                                              help="Cambiar apariencia: oscuro / claro", key="dark_mode")
-_apply_theme(st.session_state["dark_mode"])
+    dark_mode = st.toggle("🌙 / ☀️", value=st.session_state["dark_mode"],
+                          help="Cambiar apariencia: oscuro / claro", key="dark_mode")
+
+_apply_theme(st.session_state.get("dark_mode", False))
 
 # Sidebar: general config only (no uploader, no api key here)
 with st.sidebar:
