@@ -4,11 +4,11 @@ import os
 import io
 import json
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 
 import streamlit as st
 
-# ---- OpenAI SDK (chat.completions for broad compatibility) ----
+# ---- OpenAI SDK ----
 try:
     from openai import OpenAI
 except Exception:
@@ -25,17 +25,56 @@ except Exception:
     _HAS_OCR_DEPS = False
 
 # --------------------------
-# Helpers
+# Page & Theme
 # --------------------------
-st.set_page_config(page_title="RFP Analyzer - Resumen Ejecutivo", layout="wide")
+st.set_page_config(page_title="RFP Analyzer – Resumen Ejecutivo", layout="wide")
 
+def _apply_theme(dark: bool):
+    # Basic light/dark styling using CSS injection
+    if dark:
+        st.markdown("""
+        <style>
+        .stApp { background-color: #0e1117; color: #e1e1e1; }
+        .block-container { padding-top: 1.2rem; }
+        header[data-testid="stHeader"] { background: rgba(0,0,0,0); }
+        /* Text */
+        h1, h2, h3, h4, h5, h6, label, p, span { color: #e1e1e1; }
+        /* Metrics */
+        div[data-testid="stMetricValue"], div[data-testid="stMetricLabel"], div[data-testid="stMetricDelta"] {
+            color: #e1e1e1 !important;
+        }
+        /* Inputs */
+        .stTextInput input, .stTextArea textarea, .stSelectbox [data-baseweb="select"] div {
+            color: #e1e1e1 !important;
+        }
+        /* Code blocks */
+        pre, code { background: #161a22 !important; color: #e1e1e1 !important; }
+        /* Dividers */
+        hr { border-color: #30363d; }
+        </style>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown("""
+        <style>
+        .stApp { background-color: #ffffff; color: #111111; }
+        header[data-testid="stHeader"] { background: rgba(255,255,255,0.5); }
+        div[data-testid="stMetricValue"], div[data-testid="stMetricLabel"], div[data-testid="stMetricDelta"] {
+            color: #111111 !important;
+        }
+        pre, code { background: #f6f8fa !important; color: #111111 !important; }
+        </style>
+        """, unsafe_allow_html=True)
+
+# --------------------------
+# Data structures & helpers
+# --------------------------
 @dataclass
 class PDFDoc:
     name: str
     pages_text: List[str]
     full_text: str
 
-_OCR_ENABLED = True  # Toggle programático
+_OCR_ENABLED = True  # Default
 
 KEYWORDS_EXEC = {
     # duración / vigencia
@@ -61,8 +100,7 @@ KEYWORDS_EXEC = {
 }
 
 def _score_text(text: str, weights: Dict[str, float]) -> float:
-    if not text:
-        return 0.0
+    if not text: return 0.0
     t = text.lower()
     score = 0.0
     for kw, w in (weights or {}).items():
@@ -71,7 +109,6 @@ def _score_text(text: str, weights: Dict[str, float]) -> float:
         except Exception:
             ww = 1.0
         score += t.count(kw.lower()) * ww
-    # small bonus for headings
     if any(h in t for h in [
         "presentación de ofertas", "índice", "indice",
         "objeto del contrato", "alcance del servicio",
@@ -119,7 +156,7 @@ def extract_pdf(file: io.BytesIO, filename: str) -> PDFDoc:
         if sum(len(x) for x in pages_ocr) > total_chars:
             pages = pages_ocr
 
-    return PDFDoc(name=filename, pages_text=pages, full_text="\n".join(pages))
+    return PDFDoc(name=filename, pages_text=pages, full_text="\\n".join(pages))
 
 def select_relevant_spans(docs: List[PDFDoc], k_pages: int = 16) -> Tuple[str, List[Tuple[str,int,str]]]:
     """
@@ -139,8 +176,8 @@ def select_relevant_spans(docs: List[PDFDoc], k_pages: int = 16) -> Tuple[str, L
     ctx_parts = []
     for _, dn, i, sn in top:
         spans.append((dn, i+1, sn))  # page number humanized
-        ctx_parts.append(f"[{dn} | pág {i+1}]\n{sn}")
-    context = "\n\n".join(ctx_parts)
+        ctx_parts.append(f"[{dn} | pág {i+1}]\\n{sn}")
+    context = "\\n\\n".join(ctx_parts)
     return context, spans
 
 def call_openai_extract(api_key: str, model: str, context: str) -> Dict:
@@ -153,67 +190,94 @@ def call_openai_extract(api_key: str, model: str, context: str) -> Dict:
         "Extrae del CONTEXTO los dos campos requeridos, sin inventar."
     )
     user = (
-        "CONSIDERA EXCLUSIVAMENTE EL CONTEXTO SIGUIENTE (fragmentos de pliegos):\n\n"
-        f"{context}\n\n"
-        "Devuelve JSON con el esquema EXACTO:\n"
-        "{\n"
-        '  "plazo_contratacion": str|null,\n'
-        '  "fecha_entrega_oferta": str|null,\n'
-        '  "evidencias": [{"pagina": int, "cita": str}],\n'
-        '  "referencias_paginas": [int],\n'
-        '  "discrepancias": [str]\n'
-        "}\n"
-        "- 'plazo_contratacion': duración/vigencia del servicio, incluyendo prórrogas si se especifican.\n"
-        "- 'fecha_entrega_oferta': fecha (y hora si aparece) de la entrega/presentación de la oferta técnica.\n"
-        "- Normaliza fecha a ISO 8601 si es inequívoca; si no, deja null y explica en 'discrepancias'.\n"
+        "CONSIDERA EXCLUSIVAMENTE EL CONTEXTO SIGUIENTE (fragmentos de pliegos):\\n\\n"
+        f"{context}\\n\\n"
+        "Devuelve JSON con el esquema EXACTO:\\n"
+        "{\\n"
+        '  "plazo_contratacion": str|null,\\n'
+        '  "fecha_entrega_oferta": str|null,\\n'
+        '  "evidencias": [{"pagina": int, "cita": str}],\\n'
+        '  "referencias_paginas": [int],\\n'
+        '  "discrepancias": [str]\\n'
+        "}\\n"
+        "- 'plazo_contratacion': duración/vigencia del servicio, incluyendo prórrogas si se especifican.\\n"
+        "- 'fecha_entrega_oferta': fecha (y hora si aparece) de la entrega/presentación de la oferta técnica.\\n"
+        "- Normaliza fecha a ISO 8601 si es inequívoca; si no, deja null y explica en 'discrepancias'.\\n"
         "- Llena 'evidencias' con citas breves y número de página (si no se conoce, omite o usa 0)."
     )
 
-    try:
-        rsp = client.chat.completions.create(
-            model=model,
-            temperature=0.0,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-    except Exception as e:
-        raise RuntimeError(f"Error llamando a OpenAI: {e}")
-
+    rsp = client.chat.completions.create(
+        model=model,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    )
     txt = rsp.choices[0].message.content or "{}"
     try:
         data = json.loads(txt)
     except Exception:
-        # A veces el modelo envía backticks; intenta limpiar
-        txt2 = txt.strip("` \n")
+        txt2 = txt.strip("` \\n")
         data = json.loads(txt2) if txt2.startswith("{") else {}
     return data
 
 # --------------------------
 # UI
 # --------------------------
-st.title("Análisis de Pliegos – Resumen Ejecutivo")
+# Top bar with title and theme toggle (right aligned using columns)
+col_title, col_spacer, col_toggle = st.columns([0.82, 0.06, 0.12])
+with col_title:
+    st.title("Análisis de Pliegos – Resumen Ejecutivo")
+with col_toggle:
+    # Toggle shows 🌙 when dark, ☀️ when light
+    if "dark_mode" not in st.session_state:
+        st.session_state["dark_mode"] = False
+    dark_mode = st.toggle("🌙 / ☀️", value=st.session_state["dark_mode"],
+                          help="Cambiar apariencia: oscuro / claro", key="dark_mode")
+_apply_theme(st.session_state["dark_mode"])
 
+# Sidebar config (no API key or uploader here)
 with st.sidebar:
     st.header("Configuración")
-    api_key = st.text_input("OpenAI API key", type="password", help="Se usa localmente para consultar el modelo.")
     model = st.selectbox("Modelo", ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-4.1"], index=0)
     ocr_enabled = st.toggle("Activar OCR (pypdfium2 + Tesseract)", value=_OCR_ENABLED,
                             help="Si el PDF es escaneado y PyPDF2 no extrae texto, se intentará OCR.")
     _OCR_ENABLED = ocr_enabled
+    st.caption("La clave de OpenAI se toma de **st.secrets**.")
 
-    st.caption("Sube uno o varios PDFs del pliego (Administrativo/Técnico).")
-    up_files = st.file_uploader("PDF(s) del pliego", type=["pdf"], accept_multiple_files=True)
-
+# Main area: file uploader and analyze button
+st.markdown("#### Sube los PDFs del pliego")
+up_files = st.file_uploader("PDF(s) del pliego (Administrativo/Técnico)", type=["pdf"], accept_multiple_files=True)
 analyze = st.button("Analizar resumen ejecutivo", type="primary", disabled=not up_files)
 
+# Read API key from Streamlit secrets
+def _load_openai_key_from_secrets() -> str:
+    # Accept several common layouts
+    # 1) st.secrets["openai"]["api_key"]
+    # 2) st.secrets["OPENAI_API_KEY"]
+    # 3) st.secrets["openai_api_key"]
+    try:
+        if "openai" in st.secrets and "api_key" in st.secrets["openai"]:
+            return st.secrets["openai"]["api_key"]
+    except Exception:
+        pass
+    for k in ("OPENAI_API_KEY", "openai_api_key"):
+        try:
+            if k in st.secrets:
+                return st.secrets[k]
+        except Exception:
+            pass
+    return ""
+
 if analyze:
+    api_key = _load_openai_key_from_secrets()
     if not api_key:
-        st.error("Introduce tu OpenAI API key.")
+        st.error("No se encontró la clave en **st.secrets**. Añádela en `.streamlit/secrets.toml` como `OPENAI_API_KEY='sk-...'` o `openai.api_key='...'`.")
         st.stop()
 
+    # Extract PDFs
     docs: List[PDFDoc] = []
     for f in up_files:
         try:
@@ -225,32 +289,31 @@ if analyze:
         st.error("No se pudo extraer ningún texto de los PDFs.")
         st.stop()
 
-    # Selección de páginas relevantes por keywords
+    # Select relevant pages
     context, spans = select_relevant_spans(docs, k_pages=18)
 
-    with st.expander("Contexto relevante que se envía al modelo", expanded=False):
-        st.code(context[:30000])  # visualización truncada para evitar saturación
+    with st.expander("Contexto relevante enviado al modelo", expanded=False):
+        st.code(context[:30000])
 
-    # Llamada a OpenAI para extraer datos del resumen ejecutivo
+    # OpenAI call
     try:
         data = call_openai_extract(api_key, model, context)
     except Exception as e:
         st.error(str(e))
         st.stop()
 
-    # Métricas cabecera
+    # Metrics header
     st.markdown("### Resumen ejecutivo")
     c1, c2, c3, c4 = st.columns(4)
-    imp_str = "—"  # si quieres, puedes detectar importe total en otra función
+    imp_str = "—"  # placeholder; opcional: implementar extractor de importe total
     c1.metric("Importe total", imp_str)
     c2.metric("Duración del contrato", data.get("plazo_contratacion") or "—")
     c3.metric("Fecha límite oferta técnica", data.get("fecha_entrega_oferta") or "—")
-    # "Secciones completas" aquí no aplica; mostramos nº de páginas relevantes encontradas
     c4.metric("Páginas relevantes", len(spans))
 
     st.divider()
 
-    # Panel de evidencias y discrepancias
+    # Details
     with st.expander("⏱️ Resumen ejecutivo (plazos clave)", expanded=True):
         st.write(f"- **Duración del contrato**: {data.get('plazo_contratacion') or '—'}")
         st.write(f"- **Fecha límite oferta técnica**: {data.get('fecha_entrega_oferta') or '—'}")
@@ -266,6 +329,5 @@ if analyze:
             st.caption("Discrepancias")
             for d in disc:
                 st.write(f"• {d}")
-
 else:
-    st.info("Sube tus PDFs y pulsa **Analizar resumen ejecutivo** para extraer plazos clave.")
+    st.info("Sube tus PDFs en el área principal y pulsa **Analizar resumen ejecutivo** para extraer plazos clave.")
